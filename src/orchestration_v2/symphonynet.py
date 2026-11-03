@@ -111,6 +111,30 @@ def midi_to_track_events(midi_path: str | Path) -> list[list[int]]:
     return sequences
 
 
+def chunk_track_events(sequences: list[list[int]], chunk_seconds: float = 10.0) -> list[list[list[int]]]:
+    """Split per-track event sequences into fixed-length time chunks.
+
+    Each note goes to the chunk containing its onset (keeping its full
+    duration), and onsets are re-expressed relative to the chunk start so they
+    stay inside AMT's time vocabulary. Chunks with no notes are kept as empty
+    lists so the timeline has no gaps.
+
+    Returns ``chunks[chunk_idx][track_idx]`` -> flat 4-token event list.
+    """
+    chunk_bins = round(TIME_RESOLUTION * chunk_seconds)
+    if chunk_bins >= MAX_TIME:
+        raise ValueError(f"chunk_seconds must be < {MAX_TIME / TIME_RESOLUTION} s")
+
+    last_onset = max((seq[i] - TIME_OFFSET for seq in sequences for i in range(0, len(seq), 4)), default=-1)
+    n_chunks = last_onset // chunk_bins + 1
+    chunks: list[list[list[int]]] = [[[] for _ in sequences] for _ in range(n_chunks)]
+    for track_idx, seq in enumerate(sequences):
+        for i in range(0, len(seq), 4):
+            chunk_idx, rel_onset = divmod(seq[i] - TIME_OFFSET, chunk_bins)
+            chunks[chunk_idx][track_idx].extend([TIME_OFFSET + rel_onset, *seq[i + 1 : i + 4]])
+    return chunks
+
+
 if __name__ == "__main__":
     import sys
 
