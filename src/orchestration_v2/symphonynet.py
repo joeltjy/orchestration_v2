@@ -1,17 +1,18 @@
-"""Tokenize a SymphonyNet orchestral MIDI into one AMT event sequence per track.
+"""Tokenize a SymphonyNet orchestral MIDI into one AMT note sequence per track.
 
-Each track becomes a flat list of 4-token events ``(time, dur, note, velocity)``
-using the AMT vocabulary with velocity:
+Each track becomes a list of ``Note`` objects whose four fields are AMT
+vocabulary token ids (with velocity):
 
-* ``time = TIME_OFFSET + onset_bins``        (absolute onset, 10 ms bins)
-* ``dur  = DUR_OFFSET + duration_bins``      (clipped to ``MAX_DUR - 1``)
-* ``note = NOTE_OFFSET + 128 * instr + pitch`` (instr 128 = drums)
-* ``vel  = VELOCITY_OFFSET + velocity``
+* ``onset    = TIME_OFFSET + onset_bins``          (10 ms bins)
+* ``dur      = DUR_OFFSET + duration_bins``        (clipped to ``MAX_DUR - 1``)
+* ``pitch    = NOTE_OFFSET + 128 * instr + pitch`` (AMT note token; instr 128 = drums)
+* ``velocity = VELOCITY_OFFSET + velocity``
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,20 @@ SPECIAL_OFFSET = CONTROL_OFFSET + MAX_TIME + MAX_DUR + MAX_NOTE
 VELOCITY_OFFSET = SPECIAL_OFFSET + 3
 
 DEFAULT_DURATION = TIME_RESOLUTION // 4  # for notes that are never closed
+
+
+@dataclass(frozen=True, slots=True)
+class Note:
+    """One AMT note event; every field is a token id in the AMT vocabulary."""
+
+    onset: int
+    dur: int
+    pitch: int
+    velocity: int
+
+    def tokens(self) -> list[int]:
+        """Flatten to AMT's ``(time, dur, note, velocity)`` token order."""
+        return [self.onset, self.dur, self.pitch, self.velocity]
 
 
 def _timed_messages(midi: mido.MidiFile) -> list[tuple[float, int, Any]]:
@@ -65,11 +80,11 @@ def _timed_messages(midi: mido.MidiFile) -> list[tuple[float, int, Any]]:
     return out
 
 
-def midi_to_track_events(midi_path: str | Path) -> list[list[int]]:
-    """Tokenize ``midi_path`` into one AMT event sequence per non-empty track.
+def midi_to_track_events(midi_path: str | Path) -> list[list[Note]]:
+    """Tokenize ``midi_path`` into one AMT note sequence per non-empty track.
 
     Returns a list (one entry per MIDI track that contains notes, in track
-    order) of flat token lists of length ``4 * n_notes``, sorted by onset.
+    order) of ``Note`` lists sorted by onset.
     """
     midi = mido.MidiFile(str(midi_path))
     if midi.type == 2:
@@ -99,19 +114,19 @@ def midi_to_track_events(midi_path: str | Path) -> list[list[int]]:
         for onset_s, dur_s, pitch, instr, velocity in sorted(notes[track_idx], key=lambda n: (n[0], n[2])):
             onset = round(TIME_RESOLUTION * onset_s)
             dur = DEFAULT_DURATION if dur_s is None else round(TIME_RESOLUTION * dur_s)
-            events.extend(
-                [
-                    TIME_OFFSET + onset,
-                    DUR_OFFSET + min(dur, MAX_DUR - 1),
-                    NOTE_OFFSET + MAX_PITCH * instr + pitch,
-                    VELOCITY_OFFSET + min(velocity, MAX_VELOCITY),
-                ]
+            events.append(
+                Note(
+                    onset=TIME_OFFSET + onset,
+                    dur=DUR_OFFSET + min(dur, MAX_DUR - 1),
+                    pitch=NOTE_OFFSET + MAX_PITCH * instr + pitch,
+                    velocity=VELOCITY_OFFSET + min(velocity, MAX_VELOCITY),
+                )
             )
         sequences.append(events)
     return sequences
 
 
-def chunk_track_events(sequences: list[list[int]], chunk_seconds: float = 10.0) -> list[list[list[int]]]:
+def chunk_track_events(sequences: list[list[Note]], chunk_seconds: float = 10.0) -> list[list[list[Note]]]:
     """Split per-track event sequences into fixed-length time chunks.
 
     Each note goes to the chunk containing its onset (keeping its full
@@ -119,19 +134,19 @@ def chunk_track_events(sequences: list[list[int]], chunk_seconds: float = 10.0) 
     stay inside AMT's time vocabulary. Chunks with no notes are kept as empty
     lists so the timeline has no gaps.
 
-    Returns ``chunks[chunk_idx][track_idx]`` -> flat 4-token event list.
+    Returns ``chunks[chunk_idx][track_idx]`` -> list of ``Note``.
     """
     chunk_bins = round(TIME_RESOLUTION * chunk_seconds)
     if chunk_bins >= MAX_TIME:
         raise ValueError(f"chunk_seconds must be < {MAX_TIME / TIME_RESOLUTION} s")
 
-    last_onset = max((seq[i] - TIME_OFFSET for seq in sequences for i in range(0, len(seq), 4)), default=-1)
+    last_onset = max((note.onset - TIME_OFFSET for seq in sequences for note in seq), default=-1)
     n_chunks = last_onset // chunk_bins + 1
-    chunks: list[list[list[int]]] = [[[] for _ in sequences] for _ in range(n_chunks)]
+    chunks: list[list[list[Note]]] = [[[] for _ in sequences] for _ in range(n_chunks)]
     for track_idx, seq in enumerate(sequences):
-        for i in range(0, len(seq), 4):
-            chunk_idx, rel_onset = divmod(seq[i] - TIME_OFFSET, chunk_bins)
-            chunks[chunk_idx][track_idx].extend([TIME_OFFSET + rel_onset, *seq[i + 1 : i + 4]])
+        for note in seq:
+            chunk_idx, rel_onset = divmod(note.onset - TIME_OFFSET, chunk_bins)
+            chunks[chunk_idx][track_idx].append(replace(note, onset=TIME_OFFSET + rel_onset))
     return chunks
 
 
@@ -139,5 +154,5 @@ if __name__ == "__main__":
     import sys
 
     for i, seq in enumerate(midi_to_track_events(sys.argv[1])):
-        instr = (seq[2] - NOTE_OFFSET) // MAX_PITCH
-        print(f"track {i}: instr={instr} notes={len(seq) // 4} first={seq[:4]}")
+        instr = (seq[0].pitch - NOTE_OFFSET) // MAX_PITCH
+        print(f"track {i}: instr={instr} notes={len(seq)} first={seq[0]}")

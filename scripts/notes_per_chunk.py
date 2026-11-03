@@ -17,7 +17,6 @@ from pathlib import Path
 from orchestration_v2.symphonynet import chunk_track_events, midi_to_track_events
 
 CHUNK_SECONDS = 10.0
-TOKENS_PER_NOTE = 4
 
 
 def main(midi_dir: Path, out_csv: Path) -> None:
@@ -34,7 +33,7 @@ def main(midi_dir: Path, out_csv: Path) -> None:
             failed.append((path.name, "no notes"))
             continue
         # The partial final chunk is counted like any other chunk.
-        counts = [sum(len(track) for track in chunk) // TOKENS_PER_NOTE for chunk in chunks]
+        counts = [sum(len(track) for track in chunk) for chunk in chunks]
         min_idx = counts.index(min(counts))
         max_idx = counts.index(max(counts))
         rows.append(
