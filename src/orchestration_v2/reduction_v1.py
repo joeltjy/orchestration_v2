@@ -424,6 +424,10 @@ def remove_repeated_notes(voice: list[Note], table: ReductionTable) -> list[Note
     # are all equal within BEAT_TOL (largest gap - smallest gap <= 1/48 beat). (In seconds they need not be:
     # repeated 8ths in a ritardando are 1/2 beat apart each, but their gaps in seconds grow.)
     #
+    # Consecutive chain notes must be adjacent in time: no note of the same voice may have an onset strictly
+    # between onset(n_i) and onset(n_(i+1)). Notes starting at the same time as a chain note (e.g. the rest of a
+    # chord) do not break the chain. The 4-note window above still applies on top of this.
+    #
     # A chain must contain at least 4 notes (k >= 4). Runs (step 3) are not exempt: fast repeated notes such as
     # tremolos or repeated 16ths are collapsed here too (intended).
     #
@@ -892,13 +896,21 @@ def _impl_remove_repeated_notes(voice: list[Note], table: ReductionTable) -> lis
         return notes
     v = _voice_of(notes)
     tol = float(BEAT_TOL * notes[0].ticks_per_beat)
+    # next_onset[i]: the first onset in the voice after notes[i]'s onset. Consecutive chain notes must be
+    # adjacent in time: no note of the voice may start strictly between them (notes sharing an onset are fine).
+    next_onset = [0] * len(notes)
+    following = math.inf
+    for k in range(len(notes) - 1, -1, -1):
+        next_onset[k] = following
+        if k > 0 and notes[k - 1].onset_ticks < notes[k].onset_ticks:
+            following = notes[k].onset_ticks
     used = [False] * len(notes)
     new_notes = []
     for i in range(len(notes)):
         if used[i]:
             continue
         for j in range(i + 1, min(i + 5, len(notes))):
-            if used[j] or notes[j].pitch != notes[i].pitch:
+            if used[j] or notes[j].pitch != notes[i].pitch or notes[j].onset_ticks != next_onset[i]:
                 continue
             g = notes[j].onset_ticks - notes[i].onset_ticks
             if g <= 0:
@@ -910,7 +922,7 @@ def _impl_remove_repeated_notes(voice: list[Note], table: ReductionTable) -> lis
                 if nxt is None:
                     break
                 g = notes[nxt].onset_ticks - notes[last].onset_ticks
-                if g <= 0 or max(gmax, g) - min(gmin, g) > tol:
+                if notes[nxt].onset_ticks != next_onset[last] or g <= 0 or max(gmax, g) - min(gmin, g) > tol:
                     break
                 chain.append(nxt)
                 gmin, gmax, last = min(gmin, g), max(gmax, g), nxt

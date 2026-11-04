@@ -79,3 +79,18 @@ def test_within_instances_never_reuse_a_note():
     inst = _within_instances(voice)
     used = [x for _, i, j in inst for x in (i, j)]
     assert len(used) == len(set(used))
+
+
+def test_repeated_notes_need_nothing_in_between():
+    table = ReductionTable()
+    # C4 every half beat, with a D4 between the 2nd and 3rd: the D4 starts between two chain notes
+    voice = _voice(
+        [(0, 0.4, 60), (0.5, 0.4, 60), (0.75, 0.2, 62), (1.0, 0.4, 60), (1.5, 0.4, 60), (2.0, 0.4, 60)], table
+    )
+    out = remove_repeated_notes(voice, table)
+    assert len(out) == 6  # no chain of 4 adjacent C4s: (0, 0.5) is cut by the D4, (1.0, 1.5, 2.0) is only 3
+    table = ReductionTable()
+    # a note starting together with a chain note (a chord) does not break the chain
+    voice = _voice([(0, 0.4, 60), (0.5, 0.4, 60), (0.5, 0.4, 64), (1.0, 0.4, 60), (1.5, 0.4, 60)], table)
+    out = remove_repeated_notes(voice, table)
+    assert sorted(n.pitch for n in out) == [60, 64] and len(out) == 2

@@ -77,3 +77,12 @@ own decisions where the spec is open. Every such decision is logged here with a 
   /data/scratch-oc40/joel/orchestration_src_snapshot and used via ORCHESTRATION_SRC, so the remote runs exactly
   the same splitter. The remote reproduces the test corpus totals exactly. Full run there with 32 workers for
   steps 0-5; outputs to be copied back to orchestration_v2/reductions_v1/.
+[2026-11-04 12:53] Remote run done: reduction 12:29-12:43 (steps 0-5 in ~2 min with 32 workers), corpus.pkl saved; the output
+  stage was restarted from corpus.pkl with the Vocabulary view (d43afb1) and finished at 12:50. Copied back to
+  orchestration_v2/reductions_v1/ (everything except corpus.pkl, which stays on the remote). Corpus note quads:
+  6,936,129 (step 0) -> 5,101,938 (4) -> 4,879,205 (5) -> 3,785,600 (6) -> 2,895,033 (7).
+[2026-11-04 16:50] Step 4 change (Joel): in a repeated-note chain no note of the same voice may start strictly between two
+  consecutive chain notes. Read as "strictly between": a note starting at the same time as a chain note (rest of a
+  chord) does not break the chain, and the spec's 4-note window still applies on top. Test corpus: step 4 keeps
+  226,320 note quads instead of 183,442 (the old rule skipped over notes in between); after step 7, 97,939
+  instead of 92,796. Full corpus rerun on hai-res-mobile01.
