@@ -1,0 +1,71 @@
+Agent decisions for the reduction_v1 implementation run
+=======================================================
+Joel asked (2026-11-04, ~01:15) for the reduction to be implemented and run overnight, with the agent making its
+own decisions where the spec is open. Every such decision is logged here with a timestamp.
+
+[2026-11-04 01:19] Outputs go in a new folder orchestration_v2/reductions_v1/ (reduced MIDIs, side-by-side
+  MIDIs, note_quads_per_chunk_v1.csv, the viewer). Nothing in ~/Desktop/symphonynet_classical or ~/orchestration is
+  modified; original MIDIs are read in place and not copied (disk has ~4.9 GB free).
+[2026-11-04 01:19] Voice separation (step 2) imports split_timed_segment from ~/orchestration's
+  polyphony_subsegments.py (read-only) instead of re-implementing it, so it behaves exactly "the same way" as the
+  spec asks. Consequence: its internal thresholds stay as they are in that file (mixed seconds/quarters, e.g. join
+  gap min(2 s, 2 quarters), lock max(1 s, 1 quarter), bleed max(50 ms, 1/6 beat)), not the beat-only values the spec
+  lists for step 2b-2e. The spec's own rules are applied around it (3 s silence split, top-k for overflow, leftover
+  voices, fill-in copies, primary voice).
+[2026-11-04 01:29] Note storage: positions are stored as integer ticks plus ticks_per_beat (onset_beats / dur_beats are exact
+  Fraction properties computed from them), and track_numbers / voice_ids are tuples, not frozensets. Same
+  information as the spec's fields, but about 7 million notes have to fit in 9 GB of RAM.
+[2026-11-04 01:29] Step 2: when the splitter reports overflow (k > max_k) or raises, the stretch is layered top-down by a simple
+  rule: a note's voice is 1 + the number of distinct higher pitches sounding at its onset; layers above max_k
+  (4, or 1 for contrabass) go to the stretch's leftover voice. Splitter failures are logged per piece.
+[2026-11-04 01:29] Step 2: a note's primary voice is the label of its non-copy entry in the splitter output; fill-in copies keep
+  the whole note (the splitter clips copies "until the next attack"; that clipping is not carried over).
+[2026-11-04 01:29] Step 3: removed duplicates are flagged not present (replaced_step 3) without a Replacement record, as the
+  spec says. Run limits (gap and note length <= 1/4 beat) get BEAT_TOL of slack, like the other beat rules.
+[2026-11-04 01:29] Step 4: for each note i, the first j in its 4-note window that grows into a chain of >= 4 notes is used.
+[2026-11-04 01:29] Step 5: a pattern whose notes all share one pitch (pitch order (1, 1, ..., 1), e.g. a dotted repeated-note
+  rhythm that step 4 skipped because its gaps are unequal) is allowed; it becomes one long note per repetition.
+[2026-11-04 01:29] Steps 6-7 (BPE): "follows" candidates are looked for among the next 8 notes of a voice (sorted by onset),
+  cross-track candidates among the next 12 notes of an onset cluster (clusters anchored at their first onset,
+  BEAT_TOL wide). A new token is one (merge class, starting pitch) pair. Counting is greedy and non-overlapping
+  per class within each voice / cluster, kept up to date incrementally; ties for "most common" go to the
+  smallest class key. A cross-track merged note takes the first note's pitch and instrument, the earliest onset,
+  the longest duration and the max velocity.
+[2026-11-04 01:29] Measurement: every step of a piece uses the same number of 10 s chunks (from the last onset at step 0), so
+  chunks line up across steps.
+[2026-11-04 01:29] Reduced MIDI: merged notes are unpacked through their merge classes (as a decoder would, so inner durations
+  are approximate), not replaced by the exact notes they came from. One output track per (original track,
+  tax-20 instrument); channels are assigned in turn (skipping 9), unpitched notes go on the drum channel 9, and
+  each track gets its tax-20 class's own GM program. side_by_side.mid copies the original tracks verbatim
+  (renamed "orig: ...") and puts each one's reduced track(s) right after it.
+[2026-11-04 01:29] Viewer: one self-contained viewer.html plus one data/p<id>.js per piece, loaded with script tags so it works
+  when opened straight from disk (no server). The original roll shows every note read in (plus, in grey, notes
+  of instruments that were not read in); the lower roll shows the notes present after the chosen step.
+[2026-11-04 01:29] Full run uses 6 worker processes for steps 0-5 (8 cores, leaves room for the machine).
+[2026-11-04 10:55] The first full run (01:29) finished the reduction at 02:32 (CSV, bpe_log.csv, patterns.csv written) but
+  its output stage was slow (~10 s per piece, likely memory pressure from holding the whole corpus) and was
+  killed with the session at ~02:37 after 30 of 688 pieces. Changes: the reduced corpus is now saved to
+  reductions_v1/corpus.pkl right after the reduction (outputs can be redone with --from-pickle without
+  reducing again), outputs are written by 6 worker processes, and the rerun was started detached (nohup) so
+  it survives the session ending. The reduction is deterministic (12-piece test gives identical totals), so
+  the rerun reproduces the first run's CSV.
+[2026-11-04 11:54] Bug fix: the within-voice "follows" instance finder only checked each new pair against the previous pair of
+  the same class, so one note could end up in two merges (found while checking parallel BPE; it affected the
+  first full run's steps 6-7 and the 10:56 rerun, which was stopped). It now tracks every note used per class;
+  a test covers it. Parallel BPE (option 1) gives identical results but is slower (200 pieces: 69 s vs 64 s for
+  step 6, 75 s vs 59 s for step 7), so BPE stays sequential by default (bpe_workers=1).
+[2026-11-04 11:54] Test corpus for the numpy rewrite: test_corpus.txt, the 20 densest pieces by step-0 note quads per second
+  (at most 3 per arranger), ~287k notes.
+[2026-11-04 11:58] Before the numpy rewrite, profiled the test corpus: BPE step 6 (27 s) is dominated by Fraction arithmetic
+  (12M isinstance calls from comparing ticks with Fraction tolerances) and by recounting whole long voices after
+  every merge; step 7 (11.5 s) by the same Fraction cost; steps 0-5 by the voice splitter's O(n^2)
+  "highest note for its whole duration" check. Doing exact fixes for these first (float/int tolerances per piece,
+  splitting voices into units at gaps no "follows" pair can cross, an equivalent sort-based highest-note check
+  patched in at runtime -- ~/orchestration's files are not changed), each verified against test_reference/, and
+  only vectorizing with numpy where time remains.
+[2026-11-04 12:08] Speed-ups, all exact (test corpus result identical to test_reference/: every note, merge, token and
+  measurement), test corpus 27 s -> 11.5 s: Fraction tolerances replaced by floats (only compared with integer
+  ticks); the splitter's three quadratic helpers replaced at runtime by O(n log n) equivalents in
+  src/orchestration_v2/fast_splitter.py (Fenwick-tree sweep, span sweep, pointer pass with a segment tree;
+  checked against the originals on 1,400 random cases in tests/test_fast_splitter.py); overflow layering uses
+  a sorted pitch multiset. Incremental BPE recounting was not done (Joel: not needed).

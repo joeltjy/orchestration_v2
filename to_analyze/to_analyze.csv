@@ -1,0 +1,39 @@
+piece,category,ticks_per_beat,onset_peak_frac,n_tempo_events
+bach-js_organ_achtzehn_choraele_bwv-662_(c)mccoy.mid,off grid (played),120,0.545,5
+bach_suite_3_1068_1_(c)hamm-jr.mid,off grid (played),240,0.432,30
+bach_suite_3_1068_3_(c)hamm-jr.mid,off grid (played),240,0.615,10
+bach_suite_3_1068_4_(c)hamm-jr.mid,off grid (played),240,0.638,7
+bach_suite_3_1068_5_(c)hamm-jr.mid,off grid (played),240,0.433,5
+bach_suite_4_1069_1_(c)hamm-jr.mid,off grid (played),240,0.303,21
+bach_suite_4_1069_2_(c)hamm-jr.mid,off grid (played),240,0.603,8
+bach_suite_4_1069_3_(c)hamm-jr.mid,off grid (played),240,0.623,4
+bach_suite_4_1069_5_(c)hamm-jr.mid,off grid (played),240,0.596,5
+handel_fire_music_6_(nc)anonym.mid,off grid (played),384,0.727,8
+ives_unanswered_question_(c)barker.mid,off grid (played),240,0.413,1
+karg_elert_piano_pieces_5_(c)unknown.mid,off grid (played),480,0.522,8
+mozart_overture_cosi-fan-tutte_(c)anonymous.mid,off grid (played),192,0.564,8
+bach_brandeburg_concert_1050_1_(nc)anonym.mid,tpb <= 48 (can't tell),48,1.0,39
+bach_brandeburg_concert_1050_3_(nc)anonym.mid,tpb <= 48 (can't tell),48,1.0,26
+bach_chorale_731_winds_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+beethoven_overture_113_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+beethoven_symphony_7_1_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+beethoven_symphony_7_2_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+beethoven_symphony_7_3_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+beethoven_symphony_7_4_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+beethoven_symphony_8_1_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+beethoven_symphony_8_2_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+beethoven_symphony_8_3_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+beethoven_symphony_8_4_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+beethoven_turkish-march_113_4_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+brahms_concerto_1_1_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+brahms_concerto_1_2_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+brahms_concerto_1_3_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+glinka_russlan-and-ludmilla_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+mozart_3-german-dances_605_1_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+mozart_3-german-dances_605_2_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+mozart_messia_hallelujah_572_44_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+mozart_messia_overture_572_01_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+mozart_sleigh-ride_605_3_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+tchaikovsky_concerto_2_1_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+tchaikovsky_concerto_2_2_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1
+tchaikovsky_concerto_2_3_(c)tadokoro.mid,tpb <= 48 (can't tell),10,1.0,1

@@ -52,3 +52,12 @@ site/
 # IDE files
 # .idea/
 # .vscode/
+
+# reduction data and outputs (kept local / on scratch, not in git)
+.DS_Store
+reductions_v1/
+test_reference/
+to_verify/
+to_analyze/*.mid
+to_analyze/regridded*/
+notes_per_chunk.csv

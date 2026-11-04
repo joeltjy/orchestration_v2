@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reduction v1 viewer</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1d1d1f; --muted: #6e6e73; --line: #e3e3e8; --panel: #f6f6f8; --accent: #2a6df4;
+    --roll-bg: #fbfbfd; --grid: #ececf1; --grid-strong: #d5d5dd; --ignored: #c4c4cc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141416; --fg: #ececf0; --muted: #9a9aa3; --line: #2c2c31; --panel: #1c1c20; --accent: #6b9bff;
+      --roll-bg: #18181b; --grid: #232328; --grid-strong: #34343b; --ignored: #4a4a52;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--fg); }
+  header { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  header h1 { font-size: 16px; margin: 0 8px 0 0; }
+  .controls { padding: 8px 16px; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .group { display: flex; gap: 4px; align-items: center; }
+  label { color: var(--muted); }
+  input[type=search], select { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); }
+  input[type=search] { width: 220px; }
+  #pieceSelect { max-width: 420px; }
+  button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); cursor: pointer; }
+  button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .4; cursor: default; }
+  #info { color: var(--muted); padding: 6px 16px; }
+  #info b { color: var(--fg); font-weight: 600; }
+  main { padding: 8px 16px 24px; }
+  .rollLabel { display: flex; justify-content: space-between; color: var(--muted); margin: 10px 0 4px; }
+  .rollLabel b { color: var(--fg); }
+  canvas { display: block; width: 100%; border: 1px solid var(--line); border-radius: 6px; background: var(--roll-bg); }
+  #overview { height: 56px; cursor: pointer; }
+  .roll { height: 300px; }
+  #slider { width: 100%; margin: 8px 0 0; }
+  #tip { position: fixed; pointer-events: none; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-size: 12px; max-width: 360px; display: none; box-shadow: 0 2px 8px rgba(0,0,0,.15); z-index: 5; }
+  #legend { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 8px 0 0; color: var(--muted); font-size: 12px; }
+  #legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; background: var(--c); }
+  .hint { color: var(--muted); font-size: 12px; }
+  @media (max-width: 700px) { input[type=search] { width: 140px; } #pieceSelect { max-width: 100%; } .roll { height: 220px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Reduction v1 viewer</h1>
+  <div class="group">
+    <input id="search" type="search" placeholder="Filter pieces…">
+    <select id="pieceSelect"></select>
+    <button id="prevPiece" title="Previous piece">◀ piece</button>
+    <button id="nextPiece" title="Next piece">piece ▶</button>
+  </div>
+  <div class="group">
+    <label for="sort">sort</label>
+    <select id="sort">
+      <option value="name">name</option>
+      <option value="reduced">most reduced</option>
+      <option value="least">least reduced</option>
+      <option value="dense">densest original</option>
+    </select>
+  </div>
+</header>
+<div class="controls">
+  <div class="group" id="stepButtons"><label>reduction after step</label></div>
+  <div class="group">
+    <label for="win">window</label>
+    <select id="win">
+      <option value="10">10 s</option><option value="20" selected>20 s</option><option value="30">30 s</option>
+      <option value="60">60 s</option><option value="120">2 min</option><option value="0">whole piece</option>
+    </select>
+  </div>
+  <div class="group">
+    <button id="prevPage" title="Previous page (←)">◀ page</button>
+    <button id="nextPage" title="Next page (→)">page ▶</button>
+    <span id="pos" class="hint"></span>
+  </div>
+  <div class="group">
+    <label><input type="checkbox" id="outline" checked> outline merged notes</label>
+  </div>
+</div>
+<div id="info">Loading…</div>
+<main>
+  <div class="rollLabel"><span><b>Note density</b> per 10 s chunk (light: original, dark: selected step) — click to jump</span></div>
+  <canvas id="overview"></canvas>
+  <input id="slider" type="range" min="0" max="1000" value="0" step="1" aria-label="Position in piece">
+  <div class="rollLabel"><span><b>Original</b> (notes read in; grey = not read in)</span><span id="origCount"></span></div>
+  <canvas id="orig" class="roll"></canvas>
+  <div class="rollLabel"><span><b id="redTitle">Reduction</b></span><span id="redCount"></span></div>
+  <canvas id="red" class="roll"></canvas>
+  <div id="legend"></div>
+  <p class="hint">Hover a note for its history. Scroll sideways (or ← / →) to move through the piece. Merged BPE notes are drawn as the notes they decode to, outlined.</p>
+</main>
+<div id="tip"></div>
+<script src="data/index.js"></script>
+<script>
+"use strict";
+const STEP_NAMES = {0: "original notes", 4: "repeated notes", 5: "repeated patterns", 6: "BPE within voices", 7: "BPE across tracks"};
+const REMOVED_BY = {3: "removed as a same-pitch duplicate (step 3)", 4: "collapsed into a repeated-note chain (step 4)",
+  5: "replaced by a pattern chord (step 5)", 6: "merged within its voice (step 6, BPE)", 7: "merged across tracks (step 7, BPE)"};
+const NAMES = ["C","C♯","D","D♯","E","F","F♯","G","G♯","A","A♯","B"];
+const COLORS = ["#e6194b","#f58231","#ffb000","#bfaa00","#3cb44b","#2a9d8f","#008080","#4363d8","#42d4f4","#911eb4",
+  "#dc68e6","#f032e6","#a05a2c","#808000","#000075","#7a7a7a","#e07a5f","#555555","#9a6324","#469990"];
+const S = 9, L = 6;
+let index = (window.__index || []).slice(), piece = null, step = 7, t0 = 0, leavesOf = new Map(), pitchLo = 21, pitchHi = 108;
+let hits = {orig: [], red: []};
+const $ = id => document.getElementById(id);
+const pitchName = p => NAMES[p % 12] + (Math.floor(p / 12) - 1);
+const fmt = s => { const m = Math.floor(s / 60), r = (s - 60 * m).toFixed(1); return m ? `${m}:${r.padStart(4, "0")}` : `${r} s`; };
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+function sortedIndex() {
+  const how = $("sort").value, q = $("search").value.toLowerCase();
+  let list = index.filter(p => p.name.toLowerCase().includes(q));
+  const ratio = p => p.q0 ? p.q7 / p.q0 : 1;
+  if (how === "name") list.sort((a, b) => a.name.localeCompare(b.name));
+  if (how === "reduced") list.sort((a, b) => ratio(a) - ratio(b));
+  if (how === "least") list.sort((a, b) => ratio(b) - ratio(a));
+  if (how === "dense") list.sort((a, b) => b.mean0 - a.mean0);
+  return list;
+}
+function fillSelect(keepId) {
+  const sel = $("pieceSelect"), list = sortedIndex();
+  sel.innerHTML = "";
+  for (const p of list) {
+    const o = document.createElement("option");
+    o.value = p.id;
+    o.textContent = `${p.name.replace(/\.mid$/, "")}  (${p.q0} → ${p.q7} note quads)`;
+    sel.appendChild(o);
+  }
+  if (keepId != null && list.some(p => p.id === keepId)) sel.value = keepId;
+}
+function loadPiece(id) {
+  $("info").textContent = "Loading…";
+  const old = document.getElementById("pieceData");
+  if (old) old.remove();
+  const s = document.createElement("script");
+  s.id = "pieceData"; s.src = `data/p${id}.js`;
+  s.onerror = () => { $("info").textContent = `Could not load data/p${id}.js`; };
+  document.body.appendChild(s);
+}
+window.__loadPiece = data => {
+  piece = data; t0 = 0; leavesOf = new Map();
+  for (let i = 0; i < data.leaves.length; i += L) {
+    const k = data.leaves[i];
+    if (!leavesOf.has(k)) leavesOf.set(k, []);
+    leavesOf.get(k).push(i);
+  }
+  let lo = 127, hi = 0;
+  for (let i = 0; i < data.notes.length; i += S) { lo = Math.min(lo, data.notes[i + 2]); hi = Math.max(hi, data.notes[i + 2]); }
+  for (let i = 0; i < data.ignored.length; i += 5) { lo = Math.min(lo, data.ignored[i + 2]); hi = Math.max(hi, data.ignored[i + 2]); }
+  pitchLo = Math.max(0, lo - 2); pitchHi = Math.min(127, hi + 2);
+  const st = data.stats, q = s => st[`step${s}_note_quads`];
+  $("info").innerHTML = `<b>${data.name}</b> · ${data.tracks.length} tracks · ${fmt(data.duration_ms / 1000)} · note quads: ` +
+    data.steps.map(s => `step ${s} <b>${q(s)}</b>`).join(" → ") +
+    ` (${q(0) ? Math.round(100 * q(7) / q(0)) : 100}% kept) · note quads/s mean ${st.step0_mean} → ${st.step7_mean}, ` +
+    `densest chunk ${st.step0_max} → ${st.step7_max}/s`;
+  const used = new Set();
+  for (let i = 0; i < data.notes.length; i += S) used.add(data.notes[i + 3]);
+  $("legend").innerHTML = [...used].sort((a, b) => a - b).map(k => `<span style="--c:${COLORS[k]}">${data.instruments[k]}</span>`).join("") +
+    (data.ignored.length ? `<span style="--c:${css("--ignored")}">not read in</span>` : "");
+  const sel = $("pieceSelect");
+  if (+sel.value !== data.id) sel.value = data.id;
+  draw();
+};
+function windowSec() { const w = +$("win").value; return w || (piece ? piece.duration_ms / 1000 + 1 : 20); }
+function maxStart() { return piece ? Math.max(0, piece.duration_ms / 1000 - windowSec()) : 0; }
+function setStart(t) {
+  t0 = Math.min(Math.max(0, t), maxStart());
+  draw();
+}
+function setupCanvas(c) {
+  const r = c.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  c.width = Math.round(r.width * dpr); c.height = Math.round(r.height * dpr);
+  const ctx = c.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return [ctx, r.width, r.height];
+}
+function drawGrid(ctx, w, h, win) {
+  ctx.fillStyle = css("--roll-bg"); ctx.fillRect(0, 0, w, h);
+  const py = h / (pitchHi - pitchLo + 1);
+  for (let p = pitchLo; p <= pitchHi; p++) {
+    if (p % 12 === 0) {
+      const y = h - (p - pitchLo + 1) * py;
+      ctx.fillStyle = css("--grid-strong"); ctx.fillRect(0, y + py, w, 1);
+      ctx.fillStyle = css("--muted"); ctx.font = "10px sans-serif"; ctx.fillText(pitchName(p), 3, y + py - 2);
+    }
+  }
+  const stepS = win <= 12 ? 1 : win <= 35 ? 2 : win <= 70 ? 5 : win <= 150 ? 10 : 30;
+  for (let s = Math.ceil(t0 / stepS) * stepS; s <= t0 + win; s += stepS) {
+    const x = (s - t0) / win * w;
+    ctx.fillStyle = css("--grid"); ctx.fillRect(x, 0, 1, h);
+    ctx.fillStyle = css("--muted"); ctx.font = "10px sans-serif"; ctx.fillText(fmt(s), x + 3, 11);
+  }
+  return py;
+}
+function rect(ctx, w, h, py, win, on, dur, pitch, color, hitList, info) {
+  const x = (on / 1000 - t0) / win * w, x2 = ((on + dur) / 1000 - t0) / win * w;
+  if (x2 < 0 || x > w) return;
+  const y = h - (pitch - pitchLo + 1) * py;
+  ctx.fillStyle = color; ctx.fillRect(x, y, Math.max(1.5, x2 - x - 0.5), Math.max(1.5, py - 0.5));
+  hitList.push([x, y, Math.max(3, x2 - x), Math.max(3, py), info]);
+}
+function present(i) { const n = piece.notes; return n[i + 5] <= step && step < n[i + 6]; }
+function draw() {
+  if (!piece) return;
+  const win = windowSec(), n = piece.notes, end = t0 + win;
+  $("slider").max = Math.max(1, Math.round(maxStart() * 10)); $("slider").value = Math.round(t0 * 10);
+  $("pos").textContent = `${fmt(t0)} – ${fmt(Math.min(end, piece.duration_ms / 1000))} of ${fmt(piece.duration_ms / 1000)}`;
+  $("prevPage").disabled = t0 <= 0; $("nextPage").disabled = t0 >= maxStart();
+  for (const b of document.querySelectorAll("#stepButtons button")) b.classList.toggle("on", +b.dataset.step === step);
+  $("redTitle").textContent = `Reduction after step ${step} (${STEP_NAMES[step]})`;
+
+  let [ctx, w, h] = setupCanvas($("orig"));
+  let py = drawGrid(ctx, w, h, win);
+  hits.orig = [];
+  let shown = 0;
+  for (let i = 0; i < piece.ignored.length; i += 5) {
+    const on = piece.ignored[i];
+    if (on / 1000 > end) continue;
+    rect(ctx, w, h, py, win, on, piece.ignored[i + 1], piece.ignored[i + 2], css("--ignored"), hits.orig, ["ignored", i]);
+  }
+  for (let i = 0; i < n.length; i += S) {
+    if (n[i + 5] !== 0) continue;
+    if (n[i] / 1000 > end || (n[i] + n[i + 1]) / 1000 < t0) continue;
+    rect(ctx, w, h, py, win, n[i], n[i + 1], n[i + 2], COLORS[n[i + 3]], hits.orig, ["orig", i]);
+    shown++;
+  }
+  $("origCount").textContent = `${shown} notes in view`;
+
+  [ctx, w, h] = setupCanvas($("red"));
+  py = drawGrid(ctx, w, h, win);
+  hits.red = [];
+  shown = 0;
+  const outline = $("outline").checked;
+  for (let i = 0; i < n.length; i += S) {
+    if (!present(i)) continue;
+    if (n[i] / 1000 > end || (n[i] + n[i + 1]) / 1000 < t0) continue;
+    shown++;
+    if (n[i + 8]) {
+      const ls = leavesOf.get(i / S) || [];
+      let lo = 127, hi = 0;
+      for (const j of ls) {
+        const lv = piece.leaves;
+        rect(ctx, w, h, py, win, lv[j + 1], lv[j + 2], lv[j + 3], COLORS[lv[j + 4]], hits.red, ["merged", i, ls.length]);
+        lo = Math.min(lo, lv[j + 3]); hi = Math.max(hi, lv[j + 3]);
+      }
+      if (outline && ls.length) {
+        const x = (n[i] / 1000 - t0) / win * w, x2 = ((n[i] + n[i + 1]) / 1000 - t0) / win * w;
+        const y = h - (hi - pitchLo + 1) * py, y2 = h - (lo - pitchLo) * py;
+        ctx.strokeStyle = css("--fg"); ctx.globalAlpha = 0.55; ctx.lineWidth = 1;
+        ctx.strokeRect(x - 0.5, y - 1, x2 - x + 1, y2 - y + 2); ctx.globalAlpha = 1;
+      }
+    } else {
+      rect(ctx, w, h, py, win, n[i], n[i + 1], n[i + 2], COLORS[n[i + 3]], hits.red, ["red", i]);
+    }
+  }
+  $("redCount").textContent = `${shown} note quads in view`;
+  drawOverview();
+}
+function drawOverview() {
+  const [ctx, w, h] = setupCanvas($("overview")), n = piece.notes;
+  const chunks = Math.max(1, Math.ceil(piece.duration_ms / 10000)), a = new Array(chunks).fill(0), b = new Array(chunks).fill(0);
+  for (let i = 0; i < n.length; i += S) {
+    const c = Math.min(chunks - 1, Math.floor(n[i] / 10000));
+    if (n[i + 5] === 0) a[c]++;
+    if (present(i)) b[c]++;
+  }
+  const top = Math.max(1, ...a, ...b), bw = w / chunks;
+  ctx.fillStyle = css("--roll-bg"); ctx.fillRect(0, 0, w, h);
+  for (let c = 0; c < chunks; c++) {
+    ctx.fillStyle = css("--grid-strong"); ctx.fillRect(c * bw, h - a[c] / top * h, Math.max(1, bw - 1), a[c] / top * h);
+    ctx.fillStyle = css("--accent"); ctx.fillRect(c * bw, h - b[c] / top * h, Math.max(1, bw - 1), b[c] / top * h);
+  }
+  const total = piece.duration_ms / 1000, x = t0 / total * w, x2 = Math.min(w, (t0 + windowSec()) / total * w);
+  ctx.strokeStyle = css("--fg"); ctx.lineWidth = 2; ctx.strokeRect(x + 1, 1, Math.max(2, x2 - x - 2), h - 2);
+}
+function describe(kind, i, extra) {
+  if (kind === "ignored") {
+    const g = piece.ignored;
+    return `<b>${pitchName(g[i + 2])}</b> · ${piece.tracks[g[i + 3]] || "track " + g[i + 3]}<br>${fmt(g[i] / 1000)}, ${(g[i + 1] / 1000).toFixed(2)} s<br>not read in (GM program ${g[i + 4]} is not a tax-20 class)`;
+  }
+  const n = piece.notes, made = n[i + 5], gone = n[i + 6], from = n[i + 7];
+  let s = `<b>${pitchName(n[i + 2])}</b> · ${piece.instruments[n[i + 3]]} · ${piece.tracks[n[i + 4]] || "track " + n[i + 4]}<br>` +
+    `${fmt(n[i] / 1000)}, ${(n[i + 1] / 1000).toFixed(2)} s<br>`;
+  if (made === 0) s += "original note";
+  if (made === 4) s += `one long note replacing a repeated-note chain of ${from} notes (step 4)`;
+  if (made === 5) s += `chord note replacing one repetition of a pattern (${from} notes, step 5)`;
+  if (made === 6) s += `merged note quad from step 6 (BPE within a voice); decodes to ${extra} notes`;
+  if (made === 7) s += `merged note quad from step 7 (BPE across tracks); decodes to ${extra} notes`;
+  if (gone !== 99 && kind === "orig") s += `<br>${REMOVED_BY[gone] || "replaced in step " + gone}`;
+  if (gone === 99 && kind === "orig") s += "<br>kept to the end";
+  if (gone !== 99 && kind !== "orig") s += `<br>later ${REMOVED_BY[gone] || "replaced in step " + gone}`;
+  return s;
+}
+function hover(e, which) {
+  const c = $(which), r = c.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top, tip = $("tip");
+  const hit = hits[which].slice().reverse().find(([hx, hy, hw, hh]) => x >= hx && x <= hx + hw && y >= hy && y <= hy + hh);
+  if (!hit) { tip.style.display = "none"; return; }
+  const [kind, i, extra] = hit[4];
+  tip.innerHTML = describe(kind, i, extra);
+  tip.style.display = "block";
+  tip.style.left = Math.min(window.innerWidth - 370, e.clientX + 14) + "px";
+  tip.style.top = (e.clientY + 14) + "px";
+}
+
+for (const s of [0, 4, 5, 6, 7]) {
+  const b = document.createElement("button");
+  b.textContent = s; b.dataset.step = s; b.title = STEP_NAMES[s];
+  b.onclick = () => { step = s; draw(); };
+  $("stepButtons").appendChild(b);
+}
+$("search").oninput = () => fillSelect(piece && piece.id);
+$("sort").onchange = () => fillSelect(piece && piece.id);
+$("pieceSelect").onchange = e => loadPiece(+e.target.value);
+const movePiece = d => {
+  const sel = $("pieceSelect"), k = sel.selectedIndex + d;
+  if (k >= 0 && k < sel.options.length) { sel.selectedIndex = k; loadPiece(+sel.value); }
+};
+$("prevPiece").onclick = () => movePiece(-1);
+$("nextPiece").onclick = () => movePiece(1);
+$("prevPage").onclick = () => setStart(t0 - windowSec());
+$("nextPage").onclick = () => setStart(t0 + windowSec());
+$("win").onchange = () => setStart(t0);
+$("outline").onchange = draw;
+$("slider").oninput = e => setStart(+e.target.value / 10);
+$("overview").onclick = e => {
+  const r = $("overview").getBoundingClientRect();
+  setStart((e.clientX - r.left) / r.width * piece.duration_ms / 1000 - windowSec() / 2);
+};
+for (const id of ["orig", "red"]) {
+  $(id).addEventListener("mousemove", e => hover(e, id));
+  $(id).addEventListener("mouseleave", () => { $("tip").style.display = "none"; });
+  $(id).addEventListener("wheel", e => {
+    if (!piece) return;
+    e.preventDefault();
+    const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+    setStart(t0 + d / 400 * windowSec());
+  }, {passive: false});
+}
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" && e.target.type === "search") return;
+  if (e.key === "ArrowRight") setStart(t0 + windowSec() / 2);
+  if (e.key === "ArrowLeft") setStart(t0 - windowSec() / 2);
+});
+window.addEventListener("resize", draw);
+if (!index.length) { $("info").textContent = "No pieces found: data/index.js is missing or empty."; }
+else { fillSelect(); loadPiece(+$("pieceSelect").value); }
+</script>
+</body>
+</html>

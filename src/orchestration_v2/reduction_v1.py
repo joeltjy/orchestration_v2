@@ -81,32 +81,117 @@ statistics and ``2n = 10`` example chunks.
 
 from __future__ import annotations
 
+import bisect
+import csv
+import heapq
+import math
+import os
+import statistics
+import sys
+from collections import Counter, defaultdict
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 
-# --- Data structures (fields only; no logic yet) -------------------------------------------------------------
+import mido
 
-# A merge class, as used by both BPE steps. An original note's class is its tax-20 instrument (an int). A merged
-# note's class is (kind, class of first child, class of second child, pitch_gap, subdivision), where kind is
-# "within" or "between" and subdivision is the rounded Fraction for "within" merges and None for "between".
-MergeClass = int | tuple
+from orchestration_v2.symphonynet import DRUM_INSTR, midi_to_raw_notes
+
+# --- Constants ----------------------------------------------------------------------------------------------------
+
+BEAT_TOL = Fraction(1, 48)  # beats; "equal" beat positions differ by at most this
+SILENCE_SPLIT_S = 3.0  # step 2a
+RUN_MAX_BEATS = Fraction(1, 4)  # step 3 runs
+FOLLOW_TOL_BEATS = Fraction(1, 8)  # step 6 "follows"
+BETWEEN_DUR_TOL_BEATS = Fraction(1, 16)  # step 7 durations
+UNCLOSED_DUR_BEATS = Fraction(1, 2)  # step 0
+CHUNK_SECONDS = 10.0
+MEASURE_STEPS = (0, 4, 5, 6, 7)
+NO_STEP = 99  # replaced_step for notes still present at the end
+
+N_INSTRUMENTS = 20
+BASE_TOKENS = N_INSTRUMENTS * 128
+FIRST_MERGED_CLASS = 100  # class ids below this are base classes (= tax-20 index)
+UNPITCHED = 17
+
+# tax-20 index -> its own GM program, in LINE_STREAM_INSTRUMENTS_20 order (~/orchestration/src/common_instruments.py)
+TAX20_GM = (40, 41, 42, 43, 44, 45, 48, 73, 68, 71, 70, 56, 60, 57, 58, 0, 47, 116, 25, 52)
+TAX20_NAMES = (
+    "violin", "viola", "cello", "contrabass", "tremolo strings", "pizzicato strings", "string ensemble", "flute",
+    "oboe", "clarinet", "bassoon", "trumpet", "french horn", "trombone", "tuba", "piano", "timpani", "unpitched",
+    "guitar", "choir",
+)  # fmt: skip
+# GM programs that remap_line_stream_program (tax-20) sends to each class, minus the ones step 0 ignores: harp 46,
+# piccolo 72, and every program that only reaches unpitched (116) as a fallback.
+_TAX20_MEMBERS = {
+    0: (40,), 1: (41,), 2: (42,), 3: (43,), 4: (44,), 5: (45,), 6: (48, 49, 50, 51, 92), 7: (73, 74, 77, 79),
+    8: (68, 69), 9: (65, 66, 71), 10: (70,), 11: (56, 59), 12: (60,), 13: (57, 61), 14: (58,),
+    15: (0, 6, 9, 12, 13, 16, 19, 20), 16: (47,), 17: (116,), 18: (*range(24, 40), 85, 106), 19: (52, 53, 54),
+}  # fmt: skip
+GM_TO_TAX20 = {gm: idx for idx, gms in _TAX20_MEMBERS.items() for gm in gms}
+
+# read-only: the voice splitter (step 2); override with the ORCHESTRATION_SRC environment variable
+ORCHESTRATION_SRC = Path(os.environ.get("ORCHESTRATION_SRC", Path.home() / "orchestration" / "src"))
 
 
-@dataclass
+def tax20_index(program: int) -> int | None:
+    """tax-20 index for a GM program (or DRUM_INSTR); None if step 0 ignores it."""
+    if program == DRUM_INSTR:
+        return UNPITCHED
+    return GM_TO_TAX20.get(program)
+
+
+# --- Data structures ----------------------------------------------------------------------------------------------
+
+# A merge class id. Ids below FIRST_MERGED_CLASS are base classes (an original note's tax-20 instrument). A merged
+# class id refers to Corpus.class_defs[id] = (kind, class of first child, class of second child, pitch_gap, sub12),
+# where kind is "w" (within, step 6) or "b" (between, step 7) and sub12 is the subdivision in twelfths (or -1).
+MergeClass = int
+
+
+@dataclass(slots=True, eq=False)
 class Note:
+    """One note (or merged note quad). Beat positions are kept exactly as ticks; see onset_beats / dur_beats."""
+
     note_id: int
     onset: float  # seconds
     dur: float  # seconds
-    onset_beats: Fraction
-    dur_beats: Fraction
+    onset_ticks: int
+    dur_ticks: int
+    ticks_per_beat: int
+    pitch: int  # starting pitch for merged notes
+    instrument: int  # tax-20 index (first note's, for merged notes)
     note_token: int
     vel: int
-    track_numbers: frozenset[int]  # one track, except cross-track merges from step 7
-    voice_ids: frozenset[int]  # several only for fill-in copies, until the end of step 5
-    primary_voice: int | None = None  # the voice from step 2d (not a fill-in)
-    run_id: int | None = None  # set in step 3 for notes in a run
+    track_numbers: tuple[int, ...]  # one track, except cross-track merges from step 7 (ordered like their notes)
+    voice_ids: tuple[int, ...] = ()  # several only for fill-in copies, until the end of step 5
+    primary_voice: int = -1  # the voice from step 2d (not a fill-in)
+    run_id: int = -1  # set in step 3 for notes in a run
     is_present_in_reduction: bool = True
+    merge_class: int = -1  # -1 for plain notes, else a merged class id
+    created_step: int = 0
+    replaced_step: int = NO_STEP
+
+    @property
+    def onset_beats(self) -> Fraction:
+        return Fraction(self.onset_ticks, self.ticks_per_beat)
+
+    @property
+    def dur_beats(self) -> Fraction:
+        return Fraction(self.dur_ticks, self.ticks_per_beat)
+
+    @property
+    def offset_ticks(self) -> int:
+        return self.onset_ticks + self.dur_ticks
+
+    @property
+    def offset(self) -> float:
+        return self.onset + self.dur
+
+    @property
+    def cls(self) -> int:
+        return self.merge_class if self.merge_class >= 0 else self.instrument
 
 
 @dataclass
@@ -126,18 +211,44 @@ class ReductionTable:
     replacements: list[Replacement] = field(default_factory=list)
     next_note_id: int = 0
 
+    def add(self, note: Note) -> Note:
+        self.notes[note.note_id] = note
+        return note
+
+    def new_id(self) -> int:
+        self.next_note_id += 1
+        return self.next_note_id - 1
+
+    def replace(self, step: int, old: Iterable[Note], new: Iterable[Note]) -> None:
+        old, new = list(old), list(new)
+        for n in old:
+            n.is_present_in_reduction = False
+            n.replaced_step = step
+        for n in new:
+            n.created_step = step
+            self.add(n)
+        self.replacements.append(Replacement(step, tuple(n.note_id for n in old), tuple(n.note_id for n in new)))
+
 
 @dataclass
 class PatternEntry:
     pitch_order: tuple[int, ...]  # dense ranks
-    rounded_gaps: tuple[Fraction, ...]  # relative onset gaps, rounded to 1/12
+    rounded_gaps: tuple[int, ...]  # relative onset gaps, in twelfths (rounded to 1/12)
     example: list[tuple[Fraction, int]]  # (onset in beats relative to the first note, pitch)
     count: int = 0  # repetitions across the corpus
 
 
 @dataclass
 class PatternTable:
-    entries: dict[tuple[tuple[int, ...], tuple[Fraction, ...]], PatternEntry] = field(default_factory=dict)
+    entries: dict[tuple[tuple[int, ...], tuple[int, ...]], PatternEntry] = field(default_factory=dict)
+
+    def merge(self, other: PatternTable) -> None:
+        for key, e in other.entries.items():
+            mine = self.entries.get(key)
+            if mine is None:
+                self.entries[key] = e
+            else:
+                mine.count += e.count
 
 
 @dataclass
@@ -154,15 +265,31 @@ class MergeEntry:
 @dataclass
 class BPEMergeTable:
     entries: dict[int, MergeEntry] = field(default_factory=dict)  # by new note_token
-    next_token: int = 20 * 128  # after the 2,560 base tokens
+    next_token: int = BASE_TOKENS  # after the 2,560 base tokens
+    token_of: dict[tuple[int, int], int] = field(default_factory=dict)  # (class, start pitch) -> token
 
 
 @dataclass
 class Piece:
     name: str
+    path: Path
     ticks_per_beat: int
     n_tracks: int
+    track_names: list[str]
     table: ReductionTable
+    tempo: list[tuple[int, float, int]]  # (tick, seconds at tick, microseconds per beat from there on)
+    voices: dict[int, list[Note]] = field(default_factory=dict)  # voice id -> its notes (sorted)
+    voice_kind: dict[int, str] = field(default_factory=dict)  # voice id -> "group" / "overflow" / "leftover"
+    ignored: list[tuple[float, float, int, int, int]] = field(
+        default_factory=list
+    )  # (onset s, dur s, pitch, track, GM)
+    patterns: PatternTable = field(default_factory=PatternTable)  # this piece's share, merged into the corpus's
+    log: list[str] = field(default_factory=list)
+
+    def seconds_at(self, tick: float) -> float:
+        i = bisect.bisect_right(self.tempo, (tick, math.inf, 0)) - 1
+        t0, s0, us = self.tempo[max(i, 0)]
+        return s0 + (tick - t0) * us / 1e6 / self.ticks_per_beat
 
 
 @dataclass
@@ -170,18 +297,30 @@ class Corpus:
     pieces: list[Piece]
     patterns: PatternTable = field(default_factory=PatternTable)
     merges: BPEMergeTable = field(default_factory=BPEMergeTable)
+    class_defs: dict[int, tuple[str, int, int, int, int]] = field(default_factory=dict)
+    class_ids: dict[tuple[str, int, int, int, int], int] = field(default_factory=dict)
+    bpe_log: list[dict] = field(default_factory=list)
+
+    def class_id(self, key: tuple[str, int, int, int, int]) -> int:
+        cid = self.class_ids.get(key)
+        if cid is None:
+            cid = FIRST_MERGED_CLASS + len(self.class_ids)
+            self.class_ids[key] = cid
+            self.class_defs[cid] = key
+        return cid
 
 
 # --- Pipeline ----------------------------------------------------------------------------------------------
 
 
-def tokenize_corpus(corpus_dir: Path, outliers_csv: Path, measurements_csv: Path) -> Corpus:
+def tokenize_corpus(corpus_dir: Path, outliers_csv: Path, measurements_csv: Path, **options) -> Corpus:
     # Run the full reduction pipeline over every piece in ``corpus_dir``.
     #
     # Step 0 - read notes. Read each piece with symphonynet.midi_to_raw_notes, which returns ticks per beat and
     #   one RawNote list per track, each note timed in seconds and in ticks (onset_beats / dur_beats come from
     #   RawNote.onset_beats(tpb) / dur_beats(tpb)). Build the ReductionTable's Note objects from them. A note
-    #   never closed by a note-off gets AMT's default 250 ms (and the equivalent in beats at its tempo).
+    #   never closed by a note-off gets dur_beats = 1/2 beat, and its dur in seconds is that half beat converted
+    #   through the tempo map.
     #   Pieces read in: ~/Desktop/symphonynet_classical, minus the 38 timing outliers listed in
     #   to_analyze/to_analyze.csv (13 played-in files with no beat grid, 25 at 10 or 48 ticks per beat). Every
     #   remaining piece has its notes on the beat grid in ticks (constant per-track offsets were corrected on
@@ -261,9 +400,9 @@ def tokenize_corpus(corpus_dir: Path, outliers_csv: Path, measurements_csv: Path
     # Step 7 - merge notes across instruments with bpe_between_instruments().
     #
     # Returns the Corpus (every piece's ReductionTable, plus the shared PatternTable and BPEMergeTable) and writes
-    # the per-step measurements to measurements_csv (note_quads_per_chunk_v1.csv).
-
-    raise NotImplementedError
+    # the per-step measurements to measurements_csv (note_quads_per_chunk_v1.csv). ``options`` (workers,
+    # token_budget, min_count, progress, limit) are passed through to the implementation.
+    return _impl_tokenize_corpus(corpus_dir, outliers_csv, measurements_csv, **options)
 
 
 def remove_repeated_notes(voice: list[Note], table: ReductionTable) -> list[Note]:
@@ -276,7 +415,9 @@ def remove_repeated_notes(voice: list[Note], table: ReductionTable) -> list[Note
     # the next four notes after i:
     #   * if i and j have different pitches, skip the pair;
     #   * otherwise start a "repeated note chain" n_1 = i, n_2 = j, and keep extending it with later notes of
-    #     the same pitch.
+    #     the same pitch, using the same window: the next chain note must be one of the 4 notes after the chain's
+    #     current last note. The chain ends at the first step with no same-pitch note in that window (or when
+    #     the gaps stop being equal).
     #
     # A repeated note chain n_1, ..., n_k is a sequence of same-pitch notes whose onset gaps in beats
     #   (onset_beats(n_2) - onset_beats(n_1), ..., onset_beats(n_k) - onset_beats(n_(k-1)))
@@ -291,7 +432,7 @@ def remove_repeated_notes(voice: list[Note], table: ReductionTable) -> list[Note
     # chain (as in BPE), e.g. 80, 60, 70, 60 -> 80.
     #
     # Target complexity: O(n), or O(n log n) if the voice has to be re-sorted.
-    raise NotImplementedError
+    return _impl_remove_repeated_notes(voice, table)
 
 
 def remove_repeated_patterns(voice: list[Note], table: ReductionTable, patterns: PatternTable) -> list[Note]:
@@ -365,10 +506,12 @@ def remove_repeated_patterns(voice: list[Note], table: ReductionTable, patterns:
 
     Target complexity: O(n), or O(n log n) if the voice has to be re-sorted.
     """
-    raise NotImplementedError
+    return _impl_remove_repeated_patterns(voice, table, patterns)
 
 
-def bpe_within_instruments(corpus: Corpus, num_iterations: int = 10) -> None:
+def bpe_within_instruments(
+    corpus: Corpus, token_budget: int = 10_000, min_count: int = 50, progress: Callable[[str], None] = print
+) -> None:
     """Byte-pair-style merging of notes that follow one another in the same voice.
 
     Works on the whole corpus at once, because "the most common merged note class" is counted over all pieces.
@@ -378,10 +521,15 @@ def bpe_within_instruments(corpus: Corpus, num_iterations: int = 10) -> None:
         Each note's note field encodes tax-20 instrument and pitch as ``128 * instrument + pitch`` (see step 0 of
         ``tokenize_corpus``). This step adds new tokens on top of those.
 
+    Times
+        Every rule below compares times in beats: ``onset_beats``, ``dur_beats`` and
+        ``offset_beats = onset_beats + dur_beats``. The seconds fields (``onset``, ``dur``) are only carried along
+        so merged notes can be measured and written as AMT tokens.
+
     "Follows"
-        For notes ``a`` and ``b`` in the same voice, ``b`` follows ``a`` when ``a.onset < b.onset`` and
-        ``|a.offset - b.onset| < 1/8 beat``, i.e. ``b`` starts within 1/8 beat of ``a`` ending (in beats, so the
-        rule means the same notation at any tempo).
+        For notes ``a`` and ``b`` in the same voice, ``b`` follows ``a`` when ``a.onset_beats < b.onset_beats``
+        and ``|a.offset_beats - b.onset_beats| < 1/8 beat``, i.e. ``b`` starts within 1/8 beat of ``a`` ending
+        (in beats, so the rule means the same notation at any tempo).
 
     Merged note
         Every pair where ``b`` follows ``a`` defines a merged note ``m``. Here ``a`` and ``b`` are either original
@@ -390,14 +538,14 @@ def bpe_within_instruments(corpus: Corpus, num_iterations: int = 10) -> None:
         * ``children = (class of a, class of b)``. The class of an original note is just its tax-20 instrument;
           the class of a merged note is defined below. Classes, not tokens, are used so that the pitch stays out
           of the class (a token also fixes the starting pitch).
-        * ``onset = a.onset``
+        * ``onset_beats = a.onset_beats`` and ``dur_beats = b.offset_beats - a.onset_beats``
+        * ``onset = a.onset`` and ``dur = (b.onset + b.dur) - a.onset`` (the same span in seconds)
         * ``track_numbers = a.track_numbers`` and ``voice_ids = a.voice_ids``
-        * ``dur = b.offset - a.onset``
         * ``vel = max(a.vel, b.vel)``
         * ``pitch = a.pitch``
         * ``pitch_gap = b.pitch - a.pitch`` (signed, not absolute)
-        * ``subdivision = (b.onset - a.onset) / m.dur``, measured in beats. For example, if ``b`` starts 1/2 beat
-          after ``a`` and ``m.dur`` is 3/2 beats, the subdivision is 1/3. Because ``m.dur`` ends at ``b``'s
+        * ``subdivision = (b.onset_beats - a.onset_beats) / m.dur_beats``. For example, if ``b`` starts 1/2 beat
+          after ``a`` and ``m.dur_beats`` is 3/2, the subdivision is 1/3. Because ``m.dur_beats`` ends at ``b``'s
           offset, how long ``b`` is held is part of the subdivision, so articulation is part of the class
           (intended): two quarter notes give 6/12 legato but 8/12 staccato, i.e. different classes.
 
@@ -425,16 +573,21 @@ def bpe_within_instruments(corpus: Corpus, num_iterations: int = 10) -> None:
         3. Record each new token in the BPEMergeTable: its two children, instrument, starting pitch, pitch gap and
            subdivision.
 
-    Repeat for ``num_iterations``. Later iterations may merge merged notes again, so one merged note quad can
-    end up standing for many original notes.
+    Later iterations may merge merged notes again, so one merged note quad can end up standing for many original
+    notes.
+
+    Stopping rule: repeat iterations until ``token_budget`` new tokens have been created by this step, or until
+    the most common class has fewer than ``min_count`` instances in the corpus, whichever comes first. Log every
+    iteration (class, instance count, tokens created) so the budget and floor can be tuned after the first run.
 
     Target complexity: O(n) per iteration.
     """
+    _impl_bpe(corpus, 6, token_budget, min_count, progress)
 
-    raise NotImplementedError
 
-
-def bpe_between_instruments(corpus: Corpus, num_iterations: int = 10) -> None:
+def bpe_between_instruments(
+    corpus: Corpus, token_budget: int = 10_000, min_count: int = 50, progress: Callable[[str], None] = print
+) -> None:
     """Byte-pair-style merging of simultaneous notes across different tracks.
 
     Works on the whole corpus at once, like bpe_within_instruments, and updates the same tables in place.
@@ -451,11 +604,11 @@ def bpe_between_instruments(corpus: Corpus, num_iterations: int = 10) -> None:
 
         * ``children = (class of x, class of y)``. The class of an original note is just its tax-20 instrument.
         * ``pitch_gap = y.pitch - x.pitch`` (signed)
-        * ``onset``: the earliest onset among its notes
+        * ``onset_beats`` / ``onset``: the earliest onset among its notes (in beats / in seconds)
         * ``track_numbers``: the set of tracks its notes came from
         * ``instruments``: its notes' tax-20 instruments, in the order above. This starts with two and grows as
           merged notes are merged again.
-        * ``dur``: the longest duration among its notes
+        * ``dur_beats`` / ``dur``: the longest duration among its notes (in beats / in seconds)
         * ``vel``: the highest velocity among its notes
         * ``pitch``: the pitch of the first note in the order
         * ``pitch_gaps``: the list of signed pitch gaps between consecutive notes in the order (one gap for two
@@ -477,7 +630,836 @@ def bpe_between_instruments(corpus: Corpus, num_iterations: int = 10) -> None:
            up to 128 new tokens (one per starting pitch).
         3. Record each new token in the BPEMergeTable: its two children, starting pitch and pitch gap.
 
-    Repeat for ``num_iterations``. Later iterations may merge merged notes again.
+    Later iterations may merge merged notes again.
+
+    Stopping rule: repeat iterations until ``token_budget`` new tokens have been created by this step, or until
+    the most common class has fewer than ``min_count`` instances in the corpus, whichever comes first. Log every
+    iteration (class, instance count, tokens created) so the budget and floor can be tuned after the first run.
 
     Target complexity: O(n) per iteration.
     """
+    _impl_bpe(corpus, 7, token_budget, min_count, progress)
+
+
+# --- Implementation -----------------------------------------------------------------------------------------------
+
+
+def _tempo_map(midi: mido.MidiFile) -> list[tuple[int, float, int]]:
+    """(tick, seconds at that tick, microseconds per beat from there) at every tempo change, starting at tick 0."""
+    events = []
+    for track in midi.tracks:
+        tick = 0
+        for msg in track:
+            tick += msg.time
+            if msg.type == "set_tempo":
+                events.append((tick, msg.tempo))
+    events.sort(key=lambda e: e[0])
+    out, seconds, last_tick, tempo = [(0, 0.0, 500_000)], 0.0, 0, 500_000
+    for tick, new_tempo in events:
+        seconds += (tick - last_tick) * tempo / 1e6 / midi.ticks_per_beat
+        last_tick, tempo = tick, new_tempo
+        if out[-1][0] == tick:
+            out[-1] = (tick, seconds, tempo)
+        else:
+            out.append((tick, seconds, tempo))
+    return out
+
+
+def _track_names(midi: mido.MidiFile) -> list[str]:
+    """Names of the tracks that contain notes, in the same order as midi_to_raw_notes."""
+    names = []
+    for k, track in enumerate(midi.tracks):
+        if any(m.type == "note_on" and m.velocity > 0 for m in track):
+            name = next((m.name for m in track if m.type == "track_name" and m.name.strip()), f"track {k}")
+            names.append(name.strip())
+    return names
+
+
+def read_piece(path: Path) -> Piece:
+    """Step 0 (and step 1): read a MIDI into Note objects, mapped onto tax-20, sorted per track."""
+    tpb, tracks = midi_to_raw_notes(path)
+    midi = mido.MidiFile(str(path))
+    piece = Piece(path.name, path, tpb, len(tracks), _track_names(midi), ReductionTable(), _tempo_map(midi))
+    if len(piece.track_names) != len(tracks):  # should not happen; keep names aligned anyway
+        piece.track_names = [f"track {k}" for k in range(len(tracks))]
+    for t, raws in enumerate(tracks):
+        track_key = (t,)  # one shared tuple per track (memory)
+        for r in raws:
+            inst = tax20_index(r.instrument)
+            if inst is None:
+                piece.ignored.append((r.onset, r.dur if r.dur is not None else 0.0, r.pitch, t, r.instrument))
+                continue
+            if r.dur_ticks is None or r.dur is None:  # never closed: 1/2 beat
+                dur_ticks = int(UNCLOSED_DUR_BEATS * tpb)
+                dur = piece.seconds_at(r.onset_ticks + dur_ticks) - r.onset
+            else:
+                dur_ticks, dur = r.dur_ticks, float(r.dur)
+            piece.table.add(
+                Note(piece.table.new_id(), r.onset, dur, r.onset_ticks, dur_ticks, tpb, r.pitch, inst,
+                     128 * inst + r.pitch, r.velocity, track_key)
+            )  # fmt: skip
+    return piece
+
+
+def _present(notes: Iterable[Note]) -> list[Note]:
+    return sorted((n for n in notes if n.is_present_in_reduction), key=lambda n: (n.onset_ticks, n.pitch, n.note_id))
+
+
+def _notes_by_track(piece: Piece) -> dict[int, list[Note]]:
+    by = defaultdict(list)
+    for n in piece.table.notes.values():
+        if n.is_present_in_reduction:
+            by[n.track_numbers[0]].append(n)
+    return {t: _present(ns) for t, ns in sorted(by.items())}
+
+
+def separate_voices(piece: Piece) -> None:
+    """Step 2: split every track into voices (polyphony_subsegments from ~/orchestration, plus the spec's rules)."""
+    if str(ORCHESTRATION_SRC) not in sys.path:
+        sys.path.insert(0, str(ORCHESTRATION_SRC))
+    from orchestration.reduction import (  # noqa: PLC0415  # ty: ignore[unresolved-import]
+        polyphony_subsegments,
+    )
+
+    from orchestration_v2.fast_splitter import install  # noqa: PLC0415
+
+    install(polyphony_subsegments)  # O(n log n) versions of its quadratic helpers (same results)
+    TimedNote, split_timed_segment = polyphony_subsegments.TimedNote, polyphony_subsegments.split_timed_segment
+
+    voice_of: dict[tuple, int] = {}
+
+    def vid(key: tuple, kind: str) -> int:
+        if key not in voice_of:
+            voice_of[key] = len(voice_of)
+            piece.voice_kind[voice_of[key]] = kind
+        return voice_of[key]
+
+    for t, notes in _notes_by_track(piece).items():
+        segments, current, reach = [], [], -math.inf
+        for n in notes:  # a: split at silences longer than 3 s
+            if current and n.onset - reach > SILENCE_SPLIT_S:
+                segments.append(current)
+                current = []
+            current.append(n)
+            reach = max(reach, n.offset)
+        if current:
+            segments.append(current)
+
+        for si, seg in enumerate(segments):
+            voices: dict[int, set[int]] = defaultdict(set)  # note index -> voice ids
+            primary: dict[int, int] = {}
+            timed = [
+                TimedNote(index=i, onset=n.onset, offset=n.offset, pitch=n.pitch, program=TAX20_GM[n.instrument],
+                          note_id=n.note_id, velocity=n.vel, start_tick=n.onset_ticks, end_tick=n.offset_ticks,
+                          ticks_per_beat=n.ticks_per_beat)
+                for i, n in enumerate(seg)
+            ]  # fmt: skip
+            try:
+                split = split_timed_segment(timed)
+                overflow, max_k = split.overflow, split.max_k
+            except Exception as e:  # treat a splitter failure like an overflow stretch, and log it
+                piece.log.append(f"track {t} segment {si}: splitter failed ({e!r}); used top-down layering")
+                split, overflow, max_k = None, True, 4
+            if overflow or split is None:
+                _overflow_layers(seg, max_k, lambda layer, t=t, si=si: vid(
+                    (t, si, "ovf", layer) if layer else (t, si, "left"), "overflow" if layer else "leftover"),
+                    voices, primary)  # fmt: skip
+            else:
+                for gi, group in enumerate(split.groups):
+                    if group.empty:
+                        continue
+                    for tn in group.notes:
+                        src = tn.source_index
+                        for label in group.labels.get(tn.index, ()):
+                            v = vid((t, si, gi, label), "group")
+                            voices[src].add(v)
+                            if tn.fill_of is None:
+                                primary.setdefault(src, v)
+            for i, n in enumerate(seg):  # g: everything else -> this segment's leftover voice
+                if not voices[i]:
+                    v = vid((t, si, "left"), "leftover")
+                    voices[i].add(v)
+                    primary[i] = v
+                n.voice_ids = tuple(sorted(voices[i]))
+                n.primary_voice = primary.get(i, n.voice_ids[0])
+    _rebuild_voices(piece, use_copies=True)
+
+
+def _overflow_layers(seg: list[Note], max_k: int, layer_vid: Callable[[int], int], voices, primary) -> None:
+    """Overflow stretch: voice = 1 + number of distinct higher pitches sounding at the onset; past max_k: leftover.
+
+    O(n log n): notes are visited in onset order with a heap of sounding notes (by offset) and a sorted list of
+    the distinct sounding pitches (at most 128), so each count is a bisect.
+    """
+    order = sorted(range(len(seg)), key=lambda i: seg[i].onset_ticks)
+    sounding: list[tuple[int, int]] = []  # heap of (offset_ticks, pitch)
+    count: Counter = Counter()  # pitch -> sounding notes
+    distinct: list[int] = []  # sorted distinct sounding pitches
+    leftover = layer_vid(0)
+
+    def add(pitch: int) -> None:
+        if count[pitch] == 0:
+            bisect.insort(distinct, pitch)
+        count[pitch] += 1
+
+    g = 0
+    while g < len(order):
+        onset = seg[order[g]].onset_ticks
+        h = g
+        while h < len(order) and seg[order[h]].onset_ticks == onset:
+            h += 1
+        while sounding and sounding[0][0] <= onset:
+            _, pitch = heapq.heappop(sounding)
+            count[pitch] -= 1
+            if count[pitch] == 0:
+                distinct.pop(bisect.bisect_left(distinct, pitch))
+        for i in order[g:h]:  # notes starting together all sound at this onset
+            add(seg[i].pitch)
+            heapq.heappush(sounding, (seg[i].offset_ticks, seg[i].pitch))
+        for i in order[g:h]:
+            layer = len(distinct) - bisect.bisect_right(distinct, seg[i].pitch) + 1
+            v = layer_vid(layer) if layer <= max_k else leftover
+            voices[i].add(v)
+            primary[i] = v
+        g = h
+
+
+def _rebuild_voices(piece: Piece, use_copies: bool) -> None:
+    by = defaultdict(list)
+    for n in piece.table.notes.values():
+        if n.is_present_in_reduction:
+            for v in n.voice_ids if use_copies else (n.primary_voice,):
+                by[v].append(n)
+    piece.voices = {v: _present(ns) for v, ns in sorted(by.items())}
+
+
+def mark_duplicates_and_runs(piece: Piece) -> None:
+    """Step 3: drop same-pitch duplicates within a track (keep the longer), then mark runs per voice."""
+    tol = float(BEAT_TOL * piece.ticks_per_beat)  # float: compared only with integer ticks (exact)
+    for notes in _notes_by_track(piece).values():
+        by_pitch = defaultdict(list)
+        for n in notes:
+            by_pitch[n.pitch].append(n)
+        for same in by_pitch.values():
+            keep = same[0]
+            for n in same[1:]:
+                if n.onset_ticks - keep.onset_ticks <= tol:
+                    loser = n if n.dur_ticks <= keep.dur_ticks else keep  # equal length: the first in the file stays
+                    keep = keep if loser is n else n
+                    loser.is_present_in_reduction = False  # not recorded in the ReductionTable (spec)
+                    loser.replaced_step = 3
+                else:
+                    keep = n
+    _rebuild_voices(piece, use_copies=True)
+
+    run_id = 0
+    limit = float(RUN_MAX_BEATS * piece.ticks_per_beat) + tol
+    for notes in piece.voices.values():
+        start = 0
+        for i in range(1, len(notes) + 1):
+            ok = i < len(notes) and (
+                notes[i].onset_ticks > notes[i - 1].onset_ticks
+                and notes[i].onset_ticks - notes[i - 1].onset_ticks <= limit
+                and notes[i].dur_ticks <= limit
+                and notes[i - 1].dur_ticks <= limit
+            )
+            if not ok:
+                if i - start >= 5:
+                    for n in notes[start:i]:
+                        if n.run_id < 0:
+                            n.run_id = run_id
+                    run_id += 1
+                start = i
+
+
+def _new_note(table: ReductionTable, like: Note, onset_ticks: int, end_ticks: int, onset: float, end: float,
+              pitch: int, instrument: int, vel: int, voice: int) -> Note:  # fmt: skip
+    return Note(table.new_id(), onset, end - onset, onset_ticks, end_ticks - onset_ticks, like.ticks_per_beat, pitch,
+                instrument, 128 * instrument + pitch, vel, like.track_numbers, (voice,), voice)  # fmt: skip
+
+
+def _voice_of(notes: list[Note]) -> int:
+    """The voice a list from Piece.voices belongs to (the one all its notes share)."""
+    common = set(notes[0].voice_ids)
+    for n in notes[1:]:
+        common &= set(n.voice_ids)
+    return min(common) if common else notes[0].primary_voice
+
+
+def _impl_remove_repeated_notes(voice: list[Note], table: ReductionTable) -> list[Note]:
+    notes = _present(voice)
+    if len(notes) < 4:
+        return notes
+    v = _voice_of(notes)
+    tol = float(BEAT_TOL * notes[0].ticks_per_beat)
+    used = [False] * len(notes)
+    new_notes = []
+    for i in range(len(notes)):
+        if used[i]:
+            continue
+        for j in range(i + 1, min(i + 5, len(notes))):
+            if used[j] or notes[j].pitch != notes[i].pitch:
+                continue
+            g = notes[j].onset_ticks - notes[i].onset_ticks
+            if g <= 0:
+                continue
+            chain, gmin, gmax, last = [i, j], g, g, j
+            while True:
+                nxt = next((m for m in range(last + 1, min(last + 5, len(notes)))
+                            if not used[m] and notes[m].pitch == notes[i].pitch), None)  # fmt: skip
+                if nxt is None:
+                    break
+                g = notes[nxt].onset_ticks - notes[last].onset_ticks
+                if g <= 0 or max(gmax, g) - min(gmin, g) > tol:
+                    break
+                chain.append(nxt)
+                gmin, gmax, last = min(gmin, g), max(gmax, g), nxt
+            if len(chain) >= 4:
+                old = [notes[c] for c in chain]
+                first, final = old[0], old[-1]
+                m = _new_note(table, first, first.onset_ticks, final.offset_ticks, first.onset, final.offset,
+                              first.pitch, first.instrument, max(n.vel for n in old), v)  # fmt: skip
+                table.replace(4, old, [m])
+                new_notes.append(m)
+                for c in chain:
+                    used[c] = True
+                break
+    return _present([n for k, n in enumerate(notes) if not used[k]] + new_notes)
+
+
+def _dense_ranks(pitches: list[int]) -> tuple[int, ...]:
+    order = {p: r for r, p in enumerate(sorted(set(pitches)), start=1)}
+    return tuple(order[p] for p in pitches)
+
+
+def _impl_remove_repeated_patterns(voice: list[Note], table: ReductionTable, patterns: PatternTable) -> list[Note]:
+    notes = _present(voice)
+    n_notes = len(notes)
+    if n_notes < 9:
+        return notes
+    v = _voice_of(notes)
+    used = [False] * n_notes
+    new_notes: list[Note] = []
+
+    def key(s: int, k: int):
+        window = notes[s : s + k]
+        if any(n.run_id >= 0 for n in window):
+            return None
+        gaps = [window[i + 1].onset_ticks - window[i].onset_ticks for i in range(k - 1)]
+        last = window[-1]
+        gaps.append(notes[s + k].onset_ticks - last.onset_ticks if s + k < n_notes else last.dur_ticks)
+        total = sum(gaps)
+        if total <= 0:
+            return None
+        ranks = _dense_ranks([n.pitch for n in window])
+        if ranks == tuple(range(1, k + 1)) or ranks == tuple(range(k, 0, -1)):
+            return None
+        return ranks, tuple(round(12 * g / total) for g in gaps)
+
+    for k in range(3, 11):
+        cache: dict[int, object] = {}
+
+        def kk(s: int, cache: dict[int, object] = cache, k: int = k):
+            if s not in cache:
+                cache[s] = key(s, k)
+            return cache[s]
+
+        s = 0
+        while s + 3 * k <= n_notes:
+            k0 = kk(s)
+            if k0 is None or any(used[s : s + 3 * k]) or kk(s + k) != k0 or kk(s + 2 * k) != k0:
+                s += 1
+                continue
+            reps = 3
+            while s + (reps + 1) * k <= n_notes and not any(used[s + reps * k : s + (reps + 1) * k]) \
+                    and kk(s + reps * k) == k0:  # fmt: skip
+                reps += 1
+            new_notes += _replace_pattern(notes, s, k, reps, table, v)
+            for i in range(s, s + reps * k):
+                used[i] = True
+            entry = patterns.entries.get(k0)  # type: ignore[arg-type]
+            if entry is None:
+                base = notes[s]
+                example = [(Fraction(n.onset_ticks - base.onset_ticks, n.ticks_per_beat), n.pitch)
+                           for n in notes[s : s + k]]  # fmt: skip
+                entry = patterns.entries[k0] = PatternEntry(k0[0], k0[1], example)  # type: ignore[index]
+            entry.count += reps
+            s += reps * k
+    return _present([n for i, n in enumerate(notes) if not used[i]] + new_notes)
+
+
+def _replace_pattern(notes: list[Note], s: int, k: int, reps: int, table: ReductionTable, v: int) -> list[Note]:
+    made = []
+    for r in range(reps):
+        rep = notes[s + r * k : s + (r + 1) * k]
+        if r + 1 < reps:
+            nxt = notes[s + (r + 1) * k]
+            end_ticks, end = nxt.onset_ticks, nxt.onset
+        else:
+            end_ticks, end = rep[-1].offset_ticks, rep[-1].offset
+        chord = []
+        for pitch in sorted({n.pitch for n in rep}):
+            same = [n for n in rep if n.pitch == pitch]
+            chord.append(_new_note(table, rep[0], rep[0].onset_ticks, end_ticks, rep[0].onset, end, pitch,
+                                   same[0].instrument, max(n.vel for n in same), v))  # fmt: skip
+        table.replace(5, rep, chord)
+        made += chord
+    return made
+
+
+def process_piece(path: Path) -> Piece:
+    """Steps 0-5 for one piece (independent of other pieces)."""
+    piece = read_piece(path)  # steps 0 and 1
+    separate_voices(piece)  # step 2
+    mark_duplicates_and_runs(piece)  # step 3
+    for v in list(piece.voices):  # step 4
+        piece.voices[v] = remove_repeated_notes(piece.voices[v], piece.table)
+    _rebuild_voices(piece, use_copies=True)
+    for v in list(piece.voices):  # step 5
+        piece.voices[v] = remove_repeated_patterns(piece.voices[v], piece.table, piece.patterns)
+    shared: dict[int, tuple[int, ...]] = {}
+    for n in piece.table.notes.values():  # copies end here: keep only the primary voice
+        if n.is_present_in_reduction:
+            n.voice_ids = shared.setdefault(n.primary_voice, (n.primary_voice,))
+    _rebuild_voices(piece, use_copies=False)
+    return piece
+
+
+# --- BPE (steps 6 and 7) -----------------------------------------------------------------------------------------
+
+
+def _within_instances(notes: list[Note], only: tuple | None = None) -> list[tuple[tuple, int, int]]:
+    """Greedy, left-to-right, non-overlapping (per class) instances of "b follows a" in one voice.
+
+    A note already used by an earlier instance of a class cannot be part of a later instance of that class.
+    """
+    out: list[tuple[tuple, int, int]] = []
+    used: dict[tuple, set[int]] = defaultdict(set)
+    n_notes = len(notes)
+    if not notes:
+        return out
+    tol = float(FOLLOW_TOL_BEATS * notes[0].ticks_per_beat)  # float: compared only with integer ticks (exact)
+    for i, a in enumerate(notes):
+        a_off = a.offset_ticks
+        for j in range(i + 1, min(i + 9, n_notes)):
+            b = notes[j]
+            if b.onset_ticks >= a_off + tol:
+                break
+            if b.onset_ticks <= a.onset_ticks or abs(a_off - b.onset_ticks) >= tol:
+                continue
+            span = b.offset_ticks - a.onset_ticks
+            if span <= 0:
+                continue
+            key = (a.cls, b.cls, b.pitch - a.pitch, round(12 * (b.onset_ticks - a.onset_ticks) / span))
+            if only is not None and key != only:
+                continue
+            if i in used[key] or j in used[key]:
+                continue
+            used[key].update((i, j))
+            out.append((key, i, j))
+    return out
+
+
+def _between_clusters(notes: list[Note]) -> list[list[Note]]:
+    """Group present notes into onset clusters (within BEAT_TOL of the cluster's first onset), in merge order."""
+    if not notes:
+        return []
+    tol = float(BEAT_TOL * notes[0].ticks_per_beat)
+    clusters, cur = [], [notes[0]]
+    for n in notes[1:]:
+        if n.onset_ticks - cur[0].onset_ticks <= tol:
+            cur.append(n)
+        else:
+            clusters.append(cur)
+            cur = [n]
+    clusters.append(cur)
+    return [sorted(c, key=lambda n: (n.instrument, n.track_numbers[0], n.pitch, n.note_id)) for c in clusters if
+            len(c) > 1]  # fmt: skip
+
+
+def _between_instances(cluster: list[Note], only: tuple | None = None) -> list[tuple[tuple, int, int]]:
+    out, used = [], defaultdict(set)
+    tol = float(BETWEEN_DUR_TOL_BEATS * cluster[0].ticks_per_beat)
+    for i, x in enumerate(cluster):
+        for j in range(i + 1, min(i + 13, len(cluster))):
+            y = cluster[j]
+            if set(x.track_numbers) & set(y.track_numbers) or abs(x.dur_ticks - y.dur_ticks) > tol:
+                continue
+            key = (x.cls, y.cls, y.pitch - x.pitch)
+            if only is not None and key != only:
+                continue
+            if i in used[key] or j in used[key]:
+                continue
+            used[key].update((i, j))
+            out.append((key, i, j))
+    return out
+
+
+class _Units:
+    """Per-unit (voice or onset cluster) class counts with a lazily updated global max-heap."""
+
+    def __init__(self, units: list[list[Note]], count: Callable[[list[Note]], Counter]):
+        self.units, self.count = units, count
+        self.unit_counts = [count(u) for u in units]
+        self.total: Counter = Counter()
+        for c in self.unit_counts:
+            self.total.update(c)
+        self.heap = [(-c, k) for k, c in self.total.items()]
+        heapq.heapify(self.heap)
+        self.where: dict[tuple, set[int]] = defaultdict(set)
+        for ui, c in enumerate(self.unit_counts):
+            for k in c:
+                self.where[k].add(ui)
+
+    def best(self) -> tuple[tuple, int] | None:
+        while self.heap:
+            c, k = self.heap[0]
+            if self.total.get(k, 0) == -c and c < 0:
+                return k, -c
+            heapq.heappop(self.heap)
+        return None
+
+    def refresh(self, ui: int) -> None:
+        old = self.unit_counts[ui]
+        new = self.count(self.units[ui])
+        for k, c in old.items():
+            self.total[k] -= c
+            if self.total[k] <= 0:
+                del self.total[k]
+            self.where[k].discard(ui)
+        for k, c in new.items():
+            self.total[k] += c
+            self.where[k].add(ui)
+        for k in set(old) | set(new):
+            if self.total.get(k):
+                heapq.heappush(self.heap, (-self.total[k], k))
+        self.unit_counts[ui] = new
+
+
+def _bpe_units(pieces: list[Piece], step: int) -> tuple[list[list[Note]], list[int]]:
+    """Step 6: one unit per voice. Step 7: one unit per onset cluster. Returns (units, owning piece index)."""
+    units, owner = [], []
+    for pi, piece in enumerate(pieces):
+        if step == 6:
+            groups = [notes for notes in piece.voices.values() if len(notes) > 1]
+        else:
+            groups = _between_clusters(_present(n for n in piece.table.notes.values()))
+        units += groups
+        owner += [pi] * len(groups)
+    return units, owner
+
+
+def _bpe_count(step: int) -> Callable[[list[Note]], Counter]:
+    if step == 6:
+        return lambda u: Counter(k for k, _, _ in _within_instances(u))
+    return lambda u: Counter(k for k, _, _ in _between_instances(u))
+
+
+def _merge_in_unit(u: list[Note], step: int, key: tuple, cid: int, table: ReductionTable,
+                   token: Callable[[int, int], int]) -> tuple[list[Note], int, dict[int, int]]:  # fmt: skip
+    """Merge every (greedy, non-overlapping) instance of ``key`` in one unit.
+
+    ``token(pitch, instrument)`` gives the merged note's token. Returns the unit's new note list, the number of
+    merges, and {starting pitch: instrument} of the merged notes made.
+    """
+    inst = _within_instances(u, key) if step == 6 else _between_instances(u, key)
+    gone, put, pitches = set(), {}, {}
+    for _, i, j in inst:
+        a, b = u[i], u[j]
+        if step == 6:
+            onset_ticks, onset, end_ticks, end = a.onset_ticks, a.onset, b.offset_ticks, b.offset
+            tracks = a.track_numbers
+        else:
+            onset_ticks, onset = min(a.onset_ticks, b.onset_ticks), min(a.onset, b.onset)
+            end_ticks, end = max(a.offset_ticks, b.offset_ticks), max(a.offset, b.offset)
+            tracks = a.track_numbers + b.track_numbers
+        m = Note(table.new_id(), onset, end - onset, onset_ticks, end_ticks - onset_ticks, a.ticks_per_beat, a.pitch,
+                 a.instrument, token(a.pitch, a.instrument), max(a.vel, b.vel), tracks, a.voice_ids, a.primary_voice,
+                 merge_class=cid)  # fmt: skip
+        table.replace(step, [a, b], [m])
+        put[i] = m
+        gone.add(j)
+        pitches.setdefault(a.pitch, a.instrument)
+    new_u = [put.get(i, n) for i, n in enumerate(u) if i not in gone]
+    if step == 7:
+        new_u.sort(key=lambda n: (n.instrument, n.track_numbers[0], n.pitch, n.note_id))
+    return new_u, len(inst), pitches
+
+
+def _class_key(step: int, key: tuple) -> tuple[str, int, int, int, int]:
+    return ("w", key[0], key[1], key[2], key[3]) if step == 6 else ("b", key[0], key[1], key[2], -1)
+
+
+def _new_tokens(corpus: Corpus, step: int, key: tuple, cid: int, pitches: dict[int, int]) -> int:
+    """Give every (class, starting pitch) seen this iteration a token, in pitch order. Returns how many were new."""
+    made = 0
+    for pitch in sorted(pitches):
+        if (cid, pitch) in corpus.merges.token_of:
+            continue
+        tok = corpus.merges.next_token
+        corpus.merges.next_token += 1
+        corpus.merges.token_of[(cid, pitch)] = tok
+        corpus.merges.entries[tok] = MergeEntry(tok, cid, (key[0], key[1]), pitches[pitch] if step == 6 else None,
+                                                pitch, key[2], Fraction(key[3], 12) if step == 6 else None)  # fmt: skip
+        made += 1
+    return made
+
+
+def _log_iteration(corpus, step, iteration, cid, key, n_inst, merged, made_now, tokens_made, progress) -> None:
+    corpus.bpe_log.append(dict(step=step, iteration=iteration, merge_class=cid, children=f"{key[0]}+{key[1]}",
+                               pitch_gap=key[2], subdivision_12ths=key[3] if step == 6 else "", instances=n_inst,
+                               merged=merged, tokens_created=made_now, tokens_total=tokens_made))  # fmt: skip
+    if iteration % 10 == 0:
+        progress(f"step {step}: iteration {iteration}, {tokens_made} tokens, last class had {n_inst} instances")
+
+
+def _impl_bpe(corpus: Corpus, step: int, token_budget: int, min_count: int, progress: Callable[[str], None]) -> None:
+    """One BPE step in this process: one class per iteration, merged everywhere, counts updated incrementally."""
+    pieces = corpus.pieces
+    units, owner = _bpe_units(pieces, step)
+    state = _Units(units, _bpe_count(step))
+    tokens_made = iteration = 0
+    while tokens_made < token_budget:
+        found = state.best()
+        if found is None or found[1] < min_count:
+            break
+        key, n_inst = found
+        cid = corpus.class_id(_class_key(step, key))
+        merged, seen = 0, {}
+        pending: list[Note] = []
+        for ui in list(state.where.get(key, ())):
+            units[ui], n, pitches = _merge_in_unit(units[ui], step, key, cid, pieces[owner[ui]].table,
+                                                   lambda _p, _i: -1)  # fmt: skip
+            pending += [m for m in units[ui] if m.note_token == -1]
+            for pitch, inst in pitches.items():
+                seen.setdefault(pitch, inst)
+            merged += n
+            state.refresh(ui)
+        if merged == 0:  # counting and merging disagree (should not happen): drop the class so we cannot loop
+            state.total.pop(key, None)
+            progress(f"step {step}: class {key} counted {n_inst} but merged 0; skipped")
+            continue
+        made_now = _new_tokens(corpus, step, key, cid, seen)
+        for m in pending:
+            m.note_token = corpus.merges.token_of[(cid, m.pitch)]
+        tokens_made += made_now
+        iteration += 1
+        _log_iteration(corpus, step, iteration, cid, key, n_inst, merged, made_now, tokens_made, progress)
+    if step == 6:  # keep Piece.voices in sync for anything that reads it later
+        for piece in pieces:
+            _rebuild_voices(piece, use_copies=False)
+    progress(f"step {step}: done after {iteration} iterations, {tokens_made} new tokens")
+
+
+def _bpe_worker(conn, pieces: list[Piece], step: int) -> None:
+    """A worker process for parallel BPE: owns some pieces, counts and merges inside them on request."""
+    units, owner = _bpe_units(pieces, step)
+    state = _Units(units, _bpe_count(step))
+    conn.send(dict(state.total))
+    pending: list[Note] = []
+    while True:
+        msg = conn.recv()
+        if msg[0] == "merge":
+            _, key, cid = msg
+            before: Counter = Counter()
+            after: Counter = Counter()
+            merged, seen = 0, {}
+            for ui in list(state.where.get(key, ())):
+                before.update(state.unit_counts[ui])
+                units[ui], n, pitches = _merge_in_unit(units[ui], step, key, cid, pieces[owner[ui]].table,
+                                                       lambda _p, _i: -1)  # fmt: skip
+                pending += [m for m in units[ui] if m.note_token == -1 and m.merge_class == cid]
+                for pitch, inst in pitches.items():
+                    seen.setdefault(pitch, inst)
+                merged += n
+                state.refresh(ui)
+                after.update(state.unit_counts[ui])
+            delta = {k: after.get(k, 0) - before.get(k, 0) for k in set(before) | set(after)}
+            conn.send((delta, merged, seen))
+        elif msg[0] == "tokens":
+            token_of = msg[1]
+            for m in pending:
+                m.note_token = token_of[(m.merge_class, m.pitch)]
+            pending = []
+        else:  # "finish"
+            if step == 6:
+                for piece in pieces:
+                    _rebuild_voices(piece, use_copies=False)
+            conn.send(pieces)
+            conn.close()
+            return
+
+
+def _impl_bpe_parallel(corpus: Corpus, step: int, token_budget: int, min_count: int,
+                       progress: Callable[[str], None], workers: int) -> None:  # fmt: skip
+    """Same result as _impl_bpe, with the pieces split across worker processes (exact: same classes, same merges).
+
+    Each iteration the main process picks the most common class from the summed counts, every worker merges it in
+    its own pieces and reports how its counts changed, and the main process hands out the new tokens.
+    """
+    import multiprocessing as mp  # noqa: PLC0415
+
+    pieces = corpus.pieces
+    note_counts = [len(p.table.notes) for p in pieces]
+    sizes = sorted(range(len(pieces)), key=lambda i: -note_counts[i])
+    shards: list[list[int]] = [[] for _ in range(workers)]
+    load = [0] * workers
+    for i in sizes:  # balance shards by note count
+        w = load.index(min(load))
+        shards[w].append(i)
+        load[w] += note_counts[i]
+    ctx = mp.get_context("spawn")
+    conns, procs = [], []
+    for shard in shards:
+        parent, child = ctx.Pipe()
+        proc = ctx.Process(target=_bpe_worker, args=(child, [pieces[i] for i in shard], step))
+        proc.start()
+        child.close()
+        conns.append(parent)
+        procs.append(proc)
+    n_pieces = len(pieces)
+    corpus.pieces = []  # the workers own the pieces until the step ends; drop this process's references
+    pieces.clear()
+    del pieces
+
+    total: Counter = Counter()
+    for conn in conns:
+        total.update(conn.recv())
+    heap = [(-c, k) for k, c in total.items()]
+    heapq.heapify(heap)
+    tokens_made = iteration = 0
+    while tokens_made < token_budget:
+        while heap and (total.get(heap[0][1], 0) != -heap[0][0] or heap[0][0] >= 0):
+            heapq.heappop(heap)
+        if not heap or -heap[0][0] < min_count:
+            break
+        n_inst, key = -heap[0][0], heap[0][1]
+        cid = corpus.class_id(_class_key(step, key))
+        for conn in conns:
+            conn.send(("merge", key, cid))
+        merged, seen = 0, {}
+        for conn in conns:
+            delta, n, pitches = conn.recv()
+            merged += n
+            for pitch, inst in pitches.items():
+                seen.setdefault(pitch, inst)
+            for k, d in delta.items():
+                if d:
+                    total[k] += d
+                    if total[k] <= 0:
+                        del total[k]
+                    else:
+                        heapq.heappush(heap, (-total[k], k))
+        if merged == 0:
+            total.pop(key, None)
+            progress(f"step {step}: class {key} counted {n_inst} but merged 0; skipped")
+            continue
+        made_now = _new_tokens(corpus, step, key, cid, seen)
+        token_of = {(cid, p): corpus.merges.token_of[(cid, p)] for p in seen}
+        for conn in conns:
+            conn.send(("tokens", token_of))
+        tokens_made += made_now
+        iteration += 1
+        _log_iteration(corpus, step, iteration, cid, key, n_inst, merged, made_now, tokens_made, progress)
+
+    back: list[Piece | None] = [None] * n_pieces
+    for conn, shard in zip(conns, shards, strict=True):
+        conn.send(("finish",))
+        for i, piece in zip(shard, conn.recv(), strict=True):
+            back[i] = piece
+    for proc in procs:
+        proc.join()
+    corpus.pieces = [p for p in back if p is not None]
+    progress(f"step {step}: done after {iteration} iterations, {tokens_made} new tokens ({workers} workers)")
+
+
+def decode_note(corpus: Corpus, note: Note) -> list[tuple[int, int, int, int, int]]:
+    """Unpack a (merged) note into (onset_ticks, dur_ticks, pitch, instrument, track) leaves, as a decoder would."""
+
+    def n_tracks(cls: int) -> int:
+        if cls < FIRST_MERGED_CLASS:
+            return 1
+        kind, a, b, _, _ = corpus.class_defs[cls]
+        return n_tracks(a) if kind == "w" else n_tracks(a) + n_tracks(b)
+
+    def walk(cls: int, on: int, dur: int, pitch: int, tracks: tuple[int, ...]):
+        if cls < FIRST_MERGED_CLASS:
+            return [(on, dur, pitch, cls, tracks[0])]
+        kind, a, b, gap, sub12 = corpus.class_defs[cls]
+        if kind == "w":
+            split = on + round(dur * sub12 / 12)
+            return walk(a, on, split - on, pitch, tracks) + walk(b, split, on + dur - split, pitch + gap, tracks)
+        na = n_tracks(a)
+        return walk(a, on, dur, pitch, tracks[:na]) + walk(b, on, dur, pitch + gap, tracks[na:])
+
+    return walk(note.cls, note.onset_ticks, note.dur_ticks, note.pitch, note.track_numbers)
+
+
+# --- Measurement -------------------------------------------------------------------------------------------------
+
+
+def present_at(note: Note, step: int) -> bool:
+    return note.created_step <= step < note.replaced_step
+
+
+def measure(piece: Piece) -> dict:
+    """Note quads per second in 10 s chunks, at each measuring step (one CSV row)."""
+    base = [n for n in piece.table.notes.values() if n.created_step == 0]
+    n_chunks = int(max((n.onset for n in base), default=0.0) // CHUNK_SECONDS) + 1
+    row: dict = {"piece": piece.name, "n_tracks": piece.n_tracks, "n_chunks": n_chunks}
+    for step in MEASURE_STEPS:
+        counts = [0] * n_chunks
+        for n in piece.table.notes.values():
+            if present_at(n, step):
+                counts[min(int(n.onset // CHUNK_SECONDS), n_chunks - 1)] += 1
+        rates = [c / CHUNK_SECONDS for c in counts]
+        lo, hi = rates.index(min(rates)), rates.index(max(rates))
+        row.update({
+            f"step{step}_note_quads": sum(counts),
+            f"step{step}_min": rates[lo], f"step{step}_min_start_s": lo * CHUNK_SECONDS,
+            f"step{step}_min_end_s": (lo + 1) * CHUNK_SECONDS,
+            f"step{step}_max": rates[hi], f"step{step}_max_start_s": hi * CHUNK_SECONDS,
+            f"step{step}_max_end_s": (hi + 1) * CHUNK_SECONDS,
+            f"step{step}_mean": round(statistics.fmean(rates), 3),
+            f"step{step}_std": round(statistics.pstdev(rates), 3),
+        })  # fmt: skip
+    return row
+
+
+def write_measurements(corpus: Corpus, path: Path) -> None:
+    rows = [measure(p) for p in corpus.pieces]
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+
+
+def corpus_paths(corpus_dir: Path, outliers_csv: Path) -> list[Path]:
+    skip = {r["piece"] for r in csv.DictReader(outliers_csv.open())}
+    return [p for p in sorted(corpus_dir.glob("*.mid")) if p.name not in skip]
+
+
+def _impl_tokenize_corpus(corpus_dir: Path, outliers_csv: Path, measurements_csv: Path, workers: int = 6,
+                          token_budget: int = 10_000, min_count: int = 50,
+                          progress: Callable[[str], None] = print, limit: int | None = None,
+                          bpe_workers: int = 1, only: set[str] | None = None) -> Corpus:  # fmt: skip
+    from concurrent.futures import ProcessPoolExecutor  # noqa: PLC0415
+
+    paths = [p for p in corpus_paths(corpus_dir, outliers_csv) if only is None or p.name in only][:limit]
+    pieces: list[Piece] = []
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for k, piece in enumerate(pool.map(process_piece, paths, chunksize=2), start=1):
+            pieces.append(piece)
+            if k % 25 == 0 or k == len(paths):
+                progress(f"steps 0-5: {k}/{len(paths)} pieces")
+    corpus = Corpus(pieces)
+    for p in pieces:
+        corpus.patterns.merge(p.patterns)
+    del pieces  # corpus.pieces is the only reference (parallel BPE hands the pieces to its workers)
+    for step in (6, 7):
+        if bpe_workers > 1:
+            _impl_bpe_parallel(corpus, step, token_budget, min_count, progress, bpe_workers)
+        else:
+            _impl_bpe(corpus, step, token_budget, min_count, progress)
+    write_measurements(corpus, measurements_csv)
+    return corpus
