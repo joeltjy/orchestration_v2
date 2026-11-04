@@ -7,12 +7,16 @@ vocabulary token ids (with velocity):
 * ``dur      = DUR_OFFSET + duration_bins``        (clipped to ``MAX_DUR - 1``)
 * ``pitch    = NOTE_OFFSET + 128 * instr + pitch`` (AMT note token; instr 128 = drums)
 * ``velocity = VELOCITY_OFFSET + velocity``
+
+``midi_to_raw_notes`` gives the same notes before tokenization, as ``RawNote`` objects that keep both seconds and
+MIDI ticks (plus the file's ticks per beat), so callers that need beat positions can compute them exactly.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -52,8 +56,32 @@ class Note:
         return [self.onset, self.dur, self.pitch, self.velocity]
 
 
-def _timed_messages(midi: mido.MidiFile) -> list[tuple[float, int, Any]]:
-    """Return ``(seconds, track_index, message)`` for every message, in time order.
+@dataclass(frozen=True, slots=True)
+class RawNote:
+    """One note before tokenization, timed both in seconds and in MIDI ticks.
+
+    ``dur`` / ``dur_ticks`` are None for a note that is never closed by a note-off.
+    """
+
+    onset: float  # seconds
+    dur: float | None  # seconds
+    onset_ticks: int
+    dur_ticks: int | None
+    pitch: int
+    instrument: int  # GM program 0-127, or DRUM_INSTR (128) for the drum channel
+    velocity: int
+
+    def onset_beats(self, ticks_per_beat: int) -> Fraction:
+        """Onset in MIDI beats, exactly."""
+        return Fraction(self.onset_ticks, ticks_per_beat)
+
+    def dur_beats(self, ticks_per_beat: int) -> Fraction | None:
+        """Duration in MIDI beats, exactly (None if the note is never closed)."""
+        return None if self.dur_ticks is None else Fraction(self.dur_ticks, ticks_per_beat)
+
+
+def _timed_messages(midi: mido.MidiFile) -> list[tuple[float, int, int, Any]]:
+    """Return ``(seconds, tick, track_index, message)`` for every message, in time order.
 
     Tempo changes may live on any track (usually track 0), so we merge all
     tracks to build one tempo map while remembering which track each message
@@ -76,8 +104,44 @@ def _timed_messages(midi: mido.MidiFile) -> list[tuple[float, int, Any]]:
         last_tick = tick
         if msg.type == "set_tempo":
             tempo = msg.tempo
-        out.append((seconds, track_idx, msg))
+        out.append((seconds, tick, track_idx, msg))
     return out
+
+
+def midi_to_raw_notes(midi_path: str | Path) -> tuple[int, list[list[RawNote]]]:
+    """Read ``midi_path`` into one ``RawNote`` list per non-empty track.
+
+    Returns ``(ticks_per_beat, tracks)``: tracks are in MIDI track order (only those containing notes), and each
+    track's notes are sorted by onset, then pitch.
+    """
+    midi = mido.MidiFile(str(midi_path))
+    if midi.type == 2:
+        raise ValueError("Type-2 (asynchronous) MIDI files are not supported")
+
+    programs: dict[int, int] = defaultdict(int)  # channel -> program
+    # track -> list of [onset_s, duration_s | None, onset_ticks, duration_ticks | None, pitch, instr, velocity]
+    notes: dict[int, list[list]] = defaultdict(list)
+    open_notes: dict[tuple[int, int, int], list[int]] = defaultdict(list)
+
+    for t, tick, track_idx, msg in _timed_messages(midi):
+        if msg.type == "program_change":
+            programs[msg.channel] = msg.program
+        elif msg.type in ("note_on", "note_off"):
+            instr = DRUM_INSTR if msg.channel == 9 else programs[msg.channel]
+            key = (track_idx, msg.channel, msg.note)
+            if msg.type == "note_on" and msg.velocity > 0:
+                open_notes[key].append(len(notes[track_idx]))
+                notes[track_idx].append([t, None, tick, None, msg.note, instr, msg.velocity])
+            elif open_notes[key]:
+                note = notes[track_idx][open_notes[key].pop(0)]  # FIFO, like AMT
+                note[1] = t - note[0]
+                note[3] = tick - note[2]
+
+    tracks = []
+    for track_idx in sorted(notes):
+        ordered = sorted(notes[track_idx], key=lambda n: (n[0], n[4]))
+        tracks.append([RawNote(*n) for n in ordered])
+    return midi.ticks_per_beat, tracks
 
 
 def midi_to_track_events(midi_path: str | Path) -> list[list[Note]]:
@@ -86,40 +150,19 @@ def midi_to_track_events(midi_path: str | Path) -> list[list[Note]]:
     Returns a list (one entry per MIDI track that contains notes, in track
     order) of ``Note`` lists sorted by onset.
     """
-    midi = mido.MidiFile(str(midi_path))
-    if midi.type == 2:
-        raise ValueError("Type-2 (asynchronous) MIDI files are not supported")
-
-    programs: dict[int, int] = defaultdict(int)  # channel -> program
-    # track -> list of [onset_s, duration_s | None, pitch, instr, velocity]
-    notes: dict[int, list[list]] = defaultdict(list)
-    open_notes: dict[tuple[int, int, int], list[int]] = defaultdict(list)
-
-    for t, track_idx, msg in _timed_messages(midi):
-        if msg.type == "program_change":
-            programs[msg.channel] = msg.program
-        elif msg.type in ("note_on", "note_off"):
-            instr = DRUM_INSTR if msg.channel == 9 else programs[msg.channel]
-            key = (track_idx, msg.channel, msg.note)
-            if msg.type == "note_on" and msg.velocity > 0:
-                open_notes[key].append(len(notes[track_idx]))
-                notes[track_idx].append([t, None, msg.note, instr, msg.velocity])
-            elif open_notes[key]:
-                note = notes[track_idx][open_notes[key].pop(0)]  # FIFO, like AMT
-                note[1] = t - note[0]
-
+    _, tracks = midi_to_raw_notes(midi_path)
     sequences = []
-    for track_idx in sorted(notes):
+    for raw_notes in tracks:
         events = []
-        for onset_s, dur_s, pitch, instr, velocity in sorted(notes[track_idx], key=lambda n: (n[0], n[2])):
-            onset = round(TIME_RESOLUTION * onset_s)
-            dur = DEFAULT_DURATION if dur_s is None else round(TIME_RESOLUTION * dur_s)
+        for n in raw_notes:
+            onset = round(TIME_RESOLUTION * n.onset)
+            dur = DEFAULT_DURATION if n.dur is None else round(TIME_RESOLUTION * n.dur)
             events.append(
                 Note(
                     onset=TIME_OFFSET + onset,
                     dur=DUR_OFFSET + min(dur, MAX_DUR - 1),
-                    pitch=NOTE_OFFSET + MAX_PITCH * instr + pitch,
-                    velocity=VELOCITY_OFFSET + min(velocity, MAX_VELOCITY),
+                    pitch=NOTE_OFFSET + MAX_PITCH * n.instrument + n.pitch,
+                    velocity=VELOCITY_OFFSET + min(n.velocity, MAX_VELOCITY),
                 )
             )
         sequences.append(events)
