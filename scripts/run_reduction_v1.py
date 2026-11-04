@@ -27,6 +27,7 @@ from orchestration_v2.reduction_v1_outputs import (
     write_side_by_side_midi,
     write_viewer,
     write_viewer_data,
+    write_vocabulary,
 )
 
 REPO = Path(__file__).resolve().parents[1]
@@ -109,6 +110,7 @@ def main() -> None:
             if k % 50 == 0 or k == len(jobs):
                 progress(f"outputs: {k}/{len(jobs)} pieces")
     write_viewer(index, out)
+    write_vocabulary(corpus, index, out / "data")
     totals = {s: sum(e[f"q{s}"] for e in index) for s in MEASURE_STEPS}
     progress("note quads over the corpus: " + ", ".join(f"step {s}: {totals[s]}" for s in MEASURE_STEPS))
     progress(f"finished in {time.time() - start:.0f}s")

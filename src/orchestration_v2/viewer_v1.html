@@ -41,12 +41,33 @@
   #legend { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 8px 0 0; color: var(--muted); font-size: 12px; }
   #legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; background: var(--c); }
   .hint { color: var(--muted); font-size: 12px; }
+  .tabs { display: flex; gap: 4px; }
+  .tabs button.on { background: var(--fg); border-color: var(--fg); color: var(--bg); }
+  #vocabView { padding: 8px 16px 24px; }
+  #vocabView .controls { margin: 0 -16px 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--bg); cursor: pointer; white-space: nowrap; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover, tbody tr.sel { background: var(--panel); }
+  canvas.shape { width: 120px; height: 36px; border-radius: 4px; }
+  #vocabLayout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; }
+  #vocabTableWrap { max-height: 72vh; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
+  #detail { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; position: sticky; top: 8px; }
+  #detail h3 { margin: 0 0 6px; font-size: 15px; }
+  #detail canvas { width: 100%; height: 120px; margin: 6px 0; }
+  #detail ul { padding-left: 16px; margin: 6px 0; max-height: 40vh; overflow: auto; }
+  #detail li { margin: 2px 0; }
+  .link { color: var(--accent); cursor: pointer; text-decoration: underline; }
+  @media (max-width: 900px) { #vocabLayout { grid-template-columns: 1fr; } #detail { position: static; } }
   @media (max-width: 700px) { input[type=search] { width: 140px; } #pieceSelect { max-width: 100%; } .roll { height: 220px; } }
 </style>
 </head>
 <body>
 <header>
   <h1>Reduction v1 viewer</h1>
+  <div class="tabs"><button id="tabRoll" class="on">Piano roll</button><button id="tabVocab">Vocabulary</button></div>
   <div class="group">
     <input id="search" type="search" placeholder="Filter pieces…">
     <select id="pieceSelect"></select>
@@ -63,6 +84,7 @@
     </select>
   </div>
 </header>
+<div id="rollView">
 <div class="controls">
   <div class="group" id="stepButtons"><label>reduction after step</label></div>
   <div class="group">
@@ -91,8 +113,25 @@
   <div class="rollLabel"><span><b id="redTitle">Reduction</b></span><span id="redCount"></span></div>
   <canvas id="red" class="roll"></canvas>
   <div id="legend"></div>
-  <p class="hint">Hover a note for its history. Scroll sideways (or ← / →) to move through the piece. Merged BPE notes are drawn as the notes they decode to, outlined.</p>
+  <p class="hint">Hover a note for its history; click a merged note to open its class in the Vocabulary. Scroll sideways (or ← / →) to move through the piece. Merged BPE notes are drawn as the notes they decode to, outlined.</p>
 </main>
+</div>
+<div id="vocabView" hidden>
+  <div class="controls">
+    <div class="tabs"><button id="vtClasses" class="on">BPE classes (steps 6–7)</button><button id="vtPatterns">Repeated patterns (step 5)</button></div>
+    <div class="group" id="classFilters">
+      <label for="vStep">step</label>
+      <select id="vStep"><option value="">both</option><option value="6">6 within voices</option><option value="7">7 across tracks</option></select>
+      <label for="vInst">instrument</label><select id="vInst"><option value="">any</option></select>
+      <input id="vSearch" type="search" placeholder="Filter (e.g. violin, +12, #140)…">
+    </div>
+    <span id="vCount" class="hint"></span>
+  </div>
+  <div id="vocabLayout">
+    <div id="vocabTableWrap"><table><thead id="vHead"></thead><tbody id="vBody"></tbody></table></div>
+    <div id="detail"><span class="hint">Click a row to see the shape it decodes to and where it is used.</span></div>
+  </div>
+</div>
 <div id="tip"></div>
 <script src="data/index.js"></script>
 <script>
@@ -103,9 +142,10 @@ const REMOVED_BY = {3: "removed as a same-pitch duplicate (step 3)", 4: "collaps
 const NAMES = ["C","C♯","D","D♯","E","F","F♯","G","G♯","A","A♯","B"];
 const COLORS = ["#e6194b","#f58231","#ffb000","#bfaa00","#3cb44b","#2a9d8f","#008080","#4363d8","#42d4f4","#911eb4",
   "#dc68e6","#f032e6","#a05a2c","#808000","#000075","#7a7a7a","#e07a5f","#555555","#9a6324","#469990"];
-const S = 9, L = 6;
+const S = 10, L = 6;
 let index = (window.__index || []).slice(), piece = null, step = 7, t0 = 0, leavesOf = new Map(), pitchLo = 21, pitchHi = 108;
 let hits = {orig: [], red: []};
+let pendingSeek = null, vocab = null, vocabTab = "classes", vocabSort = {classes: ["instances", -1], patterns: ["count", -1]}, selected = null;
 const $ = id => document.getElementById(id);
 const pitchName = p => NAMES[p % 12] + (Math.floor(p / 12) - 1);
 const fmt = s => { const m = Math.floor(s / 60), r = (s - 60 * m).toFixed(1); return m ? `${m}:${r.padStart(4, "0")}` : `${r} s`; };
@@ -163,6 +203,7 @@ window.__loadPiece = data => {
     (data.ignored.length ? `<span style="--c:${css("--ignored")}">not read in</span>` : "");
   const sel = $("pieceSelect");
   if (+sel.value !== data.id) sel.value = data.id;
+  if (pendingSeek) { step = pendingSeek.step; t0 = Math.min(Math.max(0, pendingSeek.t), maxStart()); pendingSeek = null; }
   draw();
 };
 function windowSec() { const w = +$("win").value; return w || (piece ? piece.duration_ms / 1000 + 1 : 20); }
@@ -287,8 +328,11 @@ function describe(kind, i, extra) {
   if (made === 0) s += "original note";
   if (made === 4) s += `one long note replacing a repeated-note chain of ${from} notes (step 4)`;
   if (made === 5) s += `chord note replacing one repetition of a pattern (${from} notes, step 5)`;
-  if (made === 6) s += `merged note quad from step 6 (BPE within a voice); decodes to ${extra} notes`;
-  if (made === 7) s += `merged note quad from step 7 (BPE across tracks); decodes to ${extra} notes`;
+  if (made === 6 || made === 7) {
+    const c = vocabClass(n[i + 9]);
+    s += `merged note quad from step ${made} (BPE ${made === 6 ? "within a voice" : "across tracks"}); decodes to ${extra} notes` +
+      `<br>class #${n[i + 9]}${c ? ": " + c.desc : ""} · click to open it`;
+  }
   if (gone !== 99 && kind === "orig") s += `<br>${REMOVED_BY[gone] || "replaced in step " + gone}`;
   if (gone === 99 && kind === "orig") s += "<br>kept to the end";
   if (gone !== 99 && kind !== "orig") s += `<br>later ${REMOVED_BY[gone] || "replaced in step " + gone}`;
@@ -339,12 +383,136 @@ for (const id of ["orig", "red"]) {
     setStart(t0 + d / 400 * windowSec());
   }, {passive: false});
 }
+$("red").addEventListener("click", e => {
+  const r = $("red").getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+  const hit = hits.red.slice().reverse().find(([hx, hy, hw, hh]) => x >= hx && x <= hx + hw && y >= hy && y <= hy + hh);
+  if (hit && hit[4][0] === "merged") openClass(piece.notes[hit[4][1] + 9]);
+});
 document.addEventListener("keydown", e => {
   if (e.target.tagName === "INPUT" && e.target.type === "search") return;
   if (e.key === "ArrowRight") setStart(t0 + windowSec() / 2);
   if (e.key === "ArrowLeft") setStart(t0 - windowSec() / 2);
 });
 window.addEventListener("resize", draw);
+// ---- Vocabulary -------------------------------------------------------------------------------------------
+let vocabById = new Map();
+function vocabClass(id) { return vocabById.get(id); }
+function loadVocab(then) {
+  if (vocab) { then && then(); return; }
+  if (window.__vocab) { setVocab(window.__vocab); then && then(); return; }
+  const s = document.createElement("script");
+  s.src = "data/vocab.js";
+  s.onload = () => { setVocab(window.__vocab); then && then(); };
+  s.onerror = () => { $("vBody").innerHTML = `<tr><td>Could not load data/vocab.js</td></tr>`; };
+  document.body.appendChild(s);
+}
+function setVocab(v) {
+  vocab = v; vocabById = new Map(v.classes.map(c => [c.id, c]));
+  $("vInst").innerHTML = `<option value="">any</option>` + v.instruments.map((n, k) => `<option value="${k}">${n}</option>`).join("");
+}
+function showTab(which) {
+  $("tabRoll").classList.toggle("on", which === "roll"); $("tabVocab").classList.toggle("on", which === "vocab");
+  $("rollView").hidden = which !== "roll"; $("vocabView").hidden = which !== "vocab";
+  if (which === "vocab") loadVocab(renderVocab); else draw();
+}
+function instrumentsOf(c) { return [...new Set(c.shape.map(s => s[3]))]; }
+function drawShape(canvas, shape) {
+  const [ctx, w, h] = setupCanvas(canvas);
+  ctx.fillStyle = css("--roll-bg"); ctx.fillRect(0, 0, w, h);
+  if (!shape.length) return;
+  let lo = Math.min(...shape.map(s => s[2])), hi = Math.max(...shape.map(s => s[2]));
+  lo -= 1; hi += 1;
+  const py = h / (hi - lo + 1), end = Math.max(...shape.map(s => s[0] + s[1]));
+  for (const [on, dur, p, inst] of shape) {
+    ctx.fillStyle = COLORS[inst];
+    ctx.fillRect(on / end * w + 1, h - (p - lo + 1) * py, Math.max(2, dur / end * w - 2), Math.max(2, py - 1));
+  }
+}
+function patternShape(p) {
+  // pitch order (dense ranks) against the rhythm in twelfths of the figure
+  let t = 0;
+  return p.order.map((rank, k) => { const on = t; t += Math.max(1, p.gaps[k]); return [on * 100, Math.max(1, p.gaps[k]) * 100 - 10, rank, 4]; });
+}
+function renderVocab() {
+  if (!vocab) return;
+  const classes = vocabTab === "classes";
+  $("vtClasses").classList.toggle("on", classes); $("vtPatterns").classList.toggle("on", !classes);
+  $("classFilters").style.display = classes ? "" : "none";
+  const cols = classes
+    ? [["id", "class", 0], ["step", "step", 1], ["iteration", "iteration", 1], ["desc", "definition", 0], ["notes", "notes", 1],
+       ["instances", "instances", 1], ["merged", "merged", 1], ["tokens", "tokens", 1], ["pieces", "pieces", 1], [null, "shape", 0]]
+    : [["order", "pitch order", 0], ["gaps", "rhythm (12ths)", 0], ["k", "notes", 1], ["count", "repeats in corpus", 1], [null, "shape", 0]];
+  const [key, dir] = vocabSort[vocabTab];
+  $("vHead").innerHTML = "<tr>" + cols.map(([k, label, num]) => `<th class="${num ? "num" : ""}" data-k="${k || ""}">${label}${k === key ? (dir < 0 ? " ▼" : " ▲") : ""}</th>`).join("") + "</tr>";
+  for (const th of $("vHead").querySelectorAll("th")) th.onclick = () => {
+    const k = th.dataset.k; if (!k) return;
+    vocabSort[vocabTab] = [k, vocabSort[vocabTab][0] === k ? -vocabSort[vocabTab][1] : -1]; renderVocab();
+  };
+  let rows = classes ? vocab.classes.slice() : vocab.patterns.map((p, k) => ({...p, idx: k, k: p.order.length}));
+  if (classes) {
+    const st = $("vStep").value, inst = $("vInst").value, q = $("vSearch").value.trim().toLowerCase();
+    rows = rows.filter(c => (!st || c.step === +st) && (inst === "" || instrumentsOf(c).includes(+inst)) &&
+      (!q || c.desc.toLowerCase().includes(q) || ("#" + c.id) === q));
+  }
+  const val = r => { const v = r[key]; return Array.isArray(v) ? v.join(",") : v; };
+  rows.sort((a, b) => { const x = val(a), y = val(b); return (x > y ? 1 : x < y ? -1 : 0) * dir; });
+  $("vCount").textContent = classes ? `${rows.length} of ${vocab.classes.length} classes` :
+    `${vocab.patterns.length} most frequent of ${vocab.n_patterns} patterns`;
+  const shown = rows.slice(0, 400), body = $("vBody");
+  body.innerHTML = shown.map((r, k) => classes
+    ? `<tr data-k="${k}"><td>#${r.id}</td><td class="num">${r.step}</td><td class="num">${r.iteration ?? ""}</td><td>${r.desc}</td><td class="num">${r.notes}</td>` +
+      `<td class="num">${r.instances}</td><td class="num">${r.merged}</td><td class="num">${r.tokens}</td><td class="num">${r.pieces}</td><td><canvas class="shape"></canvas></td></tr>`
+    : `<tr data-k="${k}"><td>(${r.order.join(", ")})</td><td>${r.gaps.join(" ")}</td><td class="num">${r.k}</td><td class="num">${r.count}</td><td><canvas class="shape"></canvas></td></tr>`).join("") +
+    (rows.length > shown.length ? `<tr><td colspan="${cols.length}" class="hint">${rows.length - shown.length} more — narrow the filter to see them</td></tr>` : "");
+  body.querySelectorAll("tr[data-k]").forEach(tr => {
+    const r = shown[+tr.dataset.k];
+    drawShape(tr.querySelector("canvas"), classes ? r.shape : patternShape(r));
+    tr.onclick = () => { body.querySelectorAll("tr.sel").forEach(x => x.classList.remove("sel")); tr.classList.add("sel"); classes ? showClass(r) : showPattern(r); };
+    if (classes && selected === r.id) tr.classList.add("sel");
+  });
+}
+function pieceName(id) { const p = index.find(x => x.id === id); return p ? p.name.replace(/\.mid$/, "") : "piece " + id; }
+function showClass(c) {
+  selected = c.id;
+  const parts = [c.a, c.b].map(x => x >= 100 ? `<span class="link" data-c="${x}">#${x}</span>` : vocab.instruments[x]);
+  $("detail").innerHTML = `<h3>Class #${c.id}</h3><div>${parts[0]} + ${parts[1]}, ${c.gap >= 0 ? "+" : ""}${c.gap} semitones` +
+    (c.step === 6 ? `, second part starts at ${c.sub12}/12 of the span` : ", simultaneous, on different tracks") + `</div>` +
+    `<canvas id="detailShape"></canvas>` +
+    `<div class="hint">Step ${c.step} (BPE ${c.step === 6 ? "within voices" : "across tracks"}), iteration ${c.iteration ?? "?"}: ` +
+    `${c.instances} instances when chosen, ${c.merged} merged, ${c.tokens} tokens (one per starting pitch). Decodes to ${c.notes} notes.</div>` +
+    `<div style="margin-top:8px"><b>Used in ${c.pieces} pieces</b>${c.pieces > c.used_in.length ? ` (top ${c.used_in.length} shown)` : ""}:</div><ul>` +
+    c.used_in.map(([pid, n, ms]) => `<li><span class="link" data-p="${pid}" data-t="${ms}" data-s="${c.step}">${pieceName(pid)}</span> — ${n}×, first at ${fmt(ms / 1000)}</li>`).join("") + "</ul>";
+  drawShape($("detailShape"), c.shape);
+  $("detail").querySelectorAll("[data-c]").forEach(el => el.onclick = () => openClass(+el.dataset.c));
+  $("detail").querySelectorAll("[data-p]").forEach(el => el.onclick = () => openPieceAt(+el.dataset.p, +el.dataset.t / 1000, +el.dataset.s));
+}
+function showPattern(p) {
+  $("detail").innerHTML = `<h3>Pattern (${p.order.join(", ")})</h3><div>Rhythm in twelfths of the figure: ${p.gaps.join(" ")}. ` +
+    `Repeats ${p.count} times across the corpus.</div><canvas id="detailShape"></canvas>` +
+    `<div class="hint">Example (onset in beats from its first note: pitch): ${p.example.map(([o, pi]) => `${+o.toFixed(3)}: ${pitchName(pi)}`).join(", ")}</div>`;
+  drawShape($("detailShape"), p.example.map(([o, pi], k) => [o * 100, ((p.example[k + 1] ? p.example[k + 1][0] : o + 0.25) - o) * 100 - 4, pi, 4]));
+}
+function openClass(id) {
+  showTab("vocab");
+  loadVocab(() => {
+    vocabTab = "classes"; $("vStep").value = ""; $("vInst").value = ""; $("vSearch").value = "#" + id;
+    renderVocab(); const c = vocabClass(id); if (c) showClass(c);
+  });
+}
+function openPieceAt(pid, t, s) {
+  pendingSeek = {t: t - 2, step: s};
+  showTab("roll");
+  if (piece && piece.id === pid) { const p = pendingSeek; pendingSeek = null; step = p.step; setStart(p.t); }
+  else loadPiece(pid);
+}
+$("tabRoll").onclick = () => showTab("roll");
+$("tabVocab").onclick = () => showTab("vocab");
+$("vtClasses").onclick = () => { vocabTab = "classes"; renderVocab(); };
+$("vtPatterns").onclick = () => { vocabTab = "patterns"; renderVocab(); };
+for (const id of ["vStep", "vInst"]) $(id).onchange = renderVocab;
+$("vSearch").oninput = renderVocab;
+loadVocab();
+
 if (!index.length) { $("info").textContent = "No pieces found: data/index.js is missing or empty."; }
 else { fillSelect(); loadPiece(+$("pieceSelect").value); }
 </script>

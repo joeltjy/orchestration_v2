@@ -69,3 +69,11 @@ own decisions where the spec is open. Every such decision is logged here with a 
   src/orchestration_v2/fast_splitter.py (Fenwick-tree sweep, span sweep, pointer pass with a segment tree;
   checked against the originals on 1,400 random cases in tests/test_fast_splitter.py); overflow layering uses
   a sorted pitch multiset. Incremental BPE recounting was not done (Joel: not needed).
+[2026-11-04 12:30] The local full run (12:08) started swapping during step 7 (6.5 of 7 GB swap used; the corpus as Python
+  objects does not fit in 9 GB with everything else), so it was stopped (Joel's request) and the run moved to
+  hai-res-mobile01 (64 cores, ~130 GB free RAM): code pushed to GitHub (20a8618) and cloned to
+  /data/scratch-oc40/joel/orchestration_v2; the offset-corrected dataset rsynced to
+  /data/scratch-oc40/joel/symphonynet_classical_v2; a snapshot of this Mac's ~/orchestration/src rsynced to
+  /data/scratch-oc40/joel/orchestration_src_snapshot and used via ORCHESTRATION_SRC, so the remote runs exactly
+  the same splitter. The remote reproduces the test corpus totals exactly. Full run there with 32 workers for
+  steps 0-5; outputs to be copied back to orchestration_v2/reductions_v1/.

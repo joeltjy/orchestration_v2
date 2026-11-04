@@ -1373,26 +1373,34 @@ def _impl_bpe_parallel(corpus: Corpus, step: int, token_budget: int, min_count: 
     progress(f"step {step}: done after {iteration} iterations, {tokens_made} new tokens ({workers} workers)")
 
 
+def class_track_count(corpus: Corpus, cls: int) -> int:
+    """How many tracks a note of this class spans (1 unless it contains a cross-track merge)."""
+    if cls < FIRST_MERGED_CLASS:
+        return 1
+    kind, a, b, _, _ = corpus.class_defs[cls]
+    return class_track_count(corpus, a) if kind == "w" else class_track_count(corpus, a) + class_track_count(corpus, b)
+
+
+def decode_class(corpus: Corpus, cls: int, on: int, dur: int, pitch: int,
+                 tracks: tuple[int, ...]) -> list[tuple[int, int, int, int, int]]:  # fmt: skip
+    """Unpack a class at a given onset, duration and starting pitch into (onset, dur, pitch, instrument, track)."""
+    if cls < FIRST_MERGED_CLASS:
+        return [(on, dur, pitch, cls, tracks[0])]
+    kind, a, b, gap, sub12 = corpus.class_defs[cls]
+    if kind == "w":
+        split = on + round(dur * sub12 / 12)
+        return decode_class(corpus, a, on, split - on, pitch, tracks) + decode_class(
+            corpus, b, split, on + dur - split, pitch + gap, tracks
+        )
+    na = class_track_count(corpus, a)
+    return decode_class(corpus, a, on, dur, pitch, tracks[:na]) + decode_class(
+        corpus, b, on, dur, pitch + gap, tracks[na:]
+    )
+
+
 def decode_note(corpus: Corpus, note: Note) -> list[tuple[int, int, int, int, int]]:
     """Unpack a (merged) note into (onset_ticks, dur_ticks, pitch, instrument, track) leaves, as a decoder would."""
-
-    def n_tracks(cls: int) -> int:
-        if cls < FIRST_MERGED_CLASS:
-            return 1
-        kind, a, b, _, _ = corpus.class_defs[cls]
-        return n_tracks(a) if kind == "w" else n_tracks(a) + n_tracks(b)
-
-    def walk(cls: int, on: int, dur: int, pitch: int, tracks: tuple[int, ...]):
-        if cls < FIRST_MERGED_CLASS:
-            return [(on, dur, pitch, cls, tracks[0])]
-        kind, a, b, gap, sub12 = corpus.class_defs[cls]
-        if kind == "w":
-            split = on + round(dur * sub12 / 12)
-            return walk(a, on, split - on, pitch, tracks) + walk(b, split, on + dur - split, pitch + gap, tracks)
-        na = n_tracks(a)
-        return walk(a, on, dur, pitch, tracks[:na]) + walk(b, on, dur, pitch + gap, tracks[na:])
-
-    return walk(note.cls, note.onset_ticks, note.dur_ticks, note.pitch, note.track_numbers)
+    return decode_class(corpus, note.cls, note.onset_ticks, note.dur_ticks, note.pitch, note.track_numbers)
 
 
 # --- Measurement -------------------------------------------------------------------------------------------------
