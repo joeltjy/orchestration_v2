@@ -14,6 +14,8 @@ MIDI ticks (plus the file's ticks per beat), so callers that need beat positions
 
 from __future__ import annotations
 
+import os
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from fractions import Fraction
@@ -42,6 +44,7 @@ VELOCITY_OFFSET = SPECIAL_OFFSET + 3
 DEFAULT_DURATION = TIME_RESOLUTION // 4  # for notes that are never closed
 
 
+
 @dataclass(frozen=True, slots=True)
 class Note:
     """One AMT note event; every field is a token id in the AMT vocabulary."""
@@ -68,7 +71,7 @@ class RawNote:
     onset_ticks: int
     dur_ticks: int | None
     pitch: int
-    instrument: int  # GM program 0-127, or DRUM_INSTR (128) for the drum channel
+    instrument: int  # GM program 0-127 as read by ~/orchestration (drum channel -> 116, timpani tracks -> 47)
     velocity: int
 
     def onset_beats(self, ticks_per_beat: int) -> Fraction:
@@ -108,39 +111,46 @@ def _timed_messages(midi: mido.MidiFile) -> list[tuple[float, int, int, Any]]:
     return out
 
 
-def midi_to_raw_notes(midi_path: str | Path) -> tuple[int, list[list[RawNote]]]:
-    """Read ``midi_path`` into one ``RawNote`` list per non-empty track.
+def _orchestration_reductions():
+    """~/orchestration's ``orchestration.reduction.reductions`` (path overridable with ORCHESTRATION_SRC)."""
+    src = str(Path(os.environ.get("ORCHESTRATION_SRC", Path.home() / "orchestration" / "src")))
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from orchestration.reduction import reductions  # noqa: PLC0415  # ty: ignore[unresolved-import]
 
-    Returns ``(ticks_per_beat, tracks)``: tracks are in MIDI track order (only those containing notes), and each
-    track's notes are sorted by onset, then pitch.
+    return reductions
+
+
+def midi_to_raw_notes(midi_path: str | Path) -> tuple[int, list[list[RawNote]]]:
+    """Read ``midi_path`` into one ``RawNote`` list per track that contains notes.
+
+    The notes are exactly those of the first step of ~/orchestration's reduction:
+    ``orchestration.reduction.reductions.create_note_representation(midi_path)``, i.e.
+    ``utils.midi.extract_orchestra_notes`` followed by ``apply_program_overrides``. That means:
+
+    * program state is kept per track (one line per MIDI track), never one program per channel across the file
+      (the old merge-tracks reader inherited from AMT, which gave every track on a shared channel the program of
+      whichever track set it last; fixed in ~/orchestration commit fd8b37f);
+    * the staff name overrides ``program_change`` for winds, brass, timpani and voices when
+      ``instrument_names.resolve_track_program`` accepts it (piccolo staves -> GM 72);
+    * drum-channel notes: timpani-named tracks keep pitches 36-57 as timpani (GM 47) and drop the rest; all other
+      drum-channel notes become GM 116 (unpitched percussion);
+    * per-file program overrides (``PROGRAM_OVERRIDE_BY_MIDI_MARKER``) are applied;
+    * notes never closed by a note-off, and zero-length notes, are dropped.
+
+    Returns ``(ticks_per_beat, tracks)``: tracks are in MIDI track order (every track with a note-on, so the list
+    lines up with the track names; a track whose notes were all dropped gives an empty list), and each track's notes
+    are sorted by onset, then pitch. ``instrument`` is the GM program after all of the above.
     """
     midi = mido.MidiFile(str(midi_path))
     if midi.type == 2:
         raise ValueError("Type-2 (asynchronous) MIDI files are not supported")
-
-    programs: dict[int, int] = defaultdict(int)  # channel -> program
-    # track -> list of [onset_s, duration_s | None, onset_ticks, duration_ticks | None, pitch, instr, velocity]
-    notes: dict[int, list[list]] = defaultdict(list)
-    open_notes: dict[tuple[int, int, int], list[int]] = defaultdict(list)
-
-    for t, tick, track_idx, msg in _timed_messages(midi):
-        if msg.type == "program_change":
-            programs[msg.channel] = msg.program
-        elif msg.type in ("note_on", "note_off"):
-            instr = DRUM_INSTR if msg.channel == 9 else programs[msg.channel]
-            key = (track_idx, msg.channel, msg.note)
-            if msg.type == "note_on" and msg.velocity > 0:
-                open_notes[key].append(len(notes[track_idx]))
-                notes[track_idx].append([t, None, tick, None, msg.note, instr, msg.velocity])
-            elif open_notes[key]:
-                note = notes[track_idx][open_notes[key].pop(0)]  # FIFO, like AMT
-                note[1] = t - note[0]
-                note[3] = tick - note[2]
-
-    tracks = []
-    for track_idx in sorted(notes):
-        ordered = sorted(notes[track_idx], key=lambda n: (n[0], n[4]))
-        tracks.append([RawNote(*n) for n in ordered])
+    note_tracks = [k for k, t in enumerate(midi.tracks) if any(m.type == "note_on" and m.velocity > 0 for m in t)]
+    by_line: dict[int, list[RawNote]] = defaultdict(list)
+    for n in _orchestration_reductions().create_note_representation(Path(midi_path)):
+        by_line[n.line].append(RawNote(n.onset_s, n.offset_s - n.onset_s, n.start_tick, n.end_tick - n.start_tick,
+                                       n.pitch, n.program, n.velocity))  # fmt: skip
+    tracks = [sorted(by_line.get(k, []), key=lambda r: (r.onset, r.pitch)) for k in note_tracks]
     return midi.ticks_per_beat, tracks
 
 

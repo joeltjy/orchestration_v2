@@ -131,6 +131,8 @@ _TAX20_MEMBERS = {
 }  # fmt: skip
 GM_TO_TAX20 = {gm: idx for idx, gms in _TAX20_MEMBERS.items() for gm in gms}
 
+PATTERN_MAX_DISTINCT_PITCHES = 3  # step 5: a repeated pattern may use at most this many distinct pitches
+
 # read-only: the voice splitter (step 2); override with the ORCHESTRATION_SRC environment variable
 ORCHESTRATION_SRC = Path(os.environ.get("ORCHESTRATION_SRC", Path.home() / "orchestration" / "src"))
 
@@ -318,9 +320,11 @@ def tokenize_corpus(corpus_dir: Path, outliers_csv: Path, measurements_csv: Path
     #
     # Step 0 - read notes. Read each piece with symphonynet.midi_to_raw_notes, which returns ticks per beat and
     #   one RawNote list per track, each note timed in seconds and in ticks (onset_beats / dur_beats come from
-    #   RawNote.onset_beats(tpb) / dur_beats(tpb)). Build the ReductionTable's Note objects from them. A note
-    #   never closed by a note-off gets dur_beats = 1/2 beat, and its dur in seconds is that half beat converted
-    #   through the tempo map.
+    #   RawNote.onset_beats(tpb) / dur_beats(tpb)). Build the ReductionTable's Note objects from them.
+    #   midi_to_raw_notes returns exactly the notes of the first step of ~/orchestration's reduction
+    #   (reductions.create_note_representation: per-track programs, staff-name and per-file program overrides,
+    #   drum channel -> 116 / timpani 47). Notes never closed by a note-off are dropped there, so the 1/2-beat
+    #   fallback below no longer fires; it is kept only in case the reader changes.
     #   Pieces read in: ~/Desktop/symphonynet_classical, minus the 38 timing outliers listed in
     #   to_analyze/to_analyze.csv (13 played-in files with no beat grid, 25 at 10 or 48 ticks per beat). Every
     #   remaining piece has its notes on the beat grid in ticks (constant per-track offsets were corrected on
@@ -473,8 +477,11 @@ def remove_repeated_patterns(voice: list[Note], table: ReductionTable, patterns:
 
         * Notes that belong to a run (as defined in step 3 of ``tokenize_corpus``) are excluded from pattern
           detection. A pattern cannot span across excluded notes: they act as boundaries.
+        * Patterns with more than ``PATTERN_MAX_DISTINCT_PITCHES`` (3) distinct pitches are not counted: C G E G
+          (pitch order (1, 3, 2, 3), 3 distinct pitches) counts, C G E A (1, 3, 2, 4) does not.
         * Patterns whose pitch order is strictly increasing, ``(1, 2, ..., k)``, or strictly decreasing,
-          ``(k, ..., 2, 1)``, are not counted as repeated patterns.
+          ``(k, ..., 2, 1)``, are not counted as repeated patterns. With at most 3 distinct pitches this only
+          excludes (1, 2, 3) and (3, 2, 1).
 
         Overlapping matches: when two matches cover some of the same notes, the one with the shorter ``k`` wins
         (the smallest repeating unit). E.g. A B C repeated 6 times also matches as A B C A B C repeated 3 times;
@@ -964,6 +971,8 @@ def _impl_remove_repeated_patterns(voice: list[Note], table: ReductionTable, pat
         if total <= 0:
             return None
         ranks = _dense_ranks([n.pitch for n in window])
+        if max(ranks) > PATTERN_MAX_DISTINCT_PITCHES:
+            return None
         if ranks == tuple(range(1, k + 1)) or ranks == tuple(range(k, 0, -1)):
             return None
         return ranks, tuple(round(12 * g / total) for g in gaps)

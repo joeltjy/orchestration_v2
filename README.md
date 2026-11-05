@@ -33,6 +33,13 @@ The corpus is the SymphonyNet classical set in `~/Desktop/symphonynet_classical`
 
 * Removed 2026-11-03: `bach_cantate_62_bwv-62_6_(c)icking-archive.mid` and `beethoven_biamonti_291_(c)orlandi.mid`.
   No track in either file has 50 or more notes, too few to measure timing or reduce meaningfully.
+* Removed 2026-11-05 (moved to the Trash): 19 pieces originally written for solo organ, whose tracks are organ
+  registrations rather than orchestral parts: the 5 Reger files (`reger_135b_*`, `reger_145_3_*`), Bach BWV 535,
+  547, 548, 582, 659 and 662, Buxtehude BuxWV 156 and 223, Pachelbel's Aria Sebaldina and chorale variations, Blow's
+  Voluntary on the Old Hundredth, Dubois' Douze pièces no. 3, Franck's Fantaisie op. 16 and Saint-Saëns' Rhapsodie
+  op. 7 no. 2. Kept although they involve organ: Handel's organ concertos op. 7 nos. 1-2 (organ with orchestra),
+  the Saint-Saëns Organ Symphony theme (an orchestral work) and the many orchestral/choral pieces with an organ
+  continuo part.
 * Corrected 2026-11-03: 2,480 tracks in 199 files were quantized but shifted off the beat by a constant number of
   ticks per track (mostly Lucarelli, Pajares and Bakels; offsets up to 1/8 of a beat). Each such track was moved
   back onto the beat; durations are unchanged and no notes were moved past tick 0. Originals, the per-track shift

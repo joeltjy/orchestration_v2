@@ -56,6 +56,14 @@ def test_repeated_pattern_becomes_one_chord_per_repetition():
     assert entry.pitch_order == (1, 3, 2, 3) and entry.count == 3
 
 
+def test_patterns_with_more_than_three_distinct_pitches_are_not_patterns():
+    table, patterns = ReductionTable(), PatternTable()
+    figure = [60, 67, 64, 69]  # C G E A: 4 distinct pitches
+    voice = _voice([(i / 4, 0.25, figure[i % 4]) for i in range(12)], table)
+    assert len(remove_repeated_patterns(voice, table, patterns)) == 12
+    assert not patterns.entries
+
+
 def test_strictly_increasing_figures_are_not_patterns():
     table, patterns = ReductionTable(), PatternTable()
     voice = _voice([(i / 4, 0.25, 60 + 2 * (i % 3)) for i in range(9)], table)  # C D E, C D E, C D E

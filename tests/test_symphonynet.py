@@ -4,7 +4,7 @@ from fractions import Fraction
 
 import mido
 
-from orchestration_v2.symphonynet import DRUM_INSTR, midi_to_raw_notes, midi_to_track_events
+from orchestration_v2.symphonynet import midi_to_raw_notes, midi_to_track_events
 
 
 def _write_midi(path):
@@ -25,7 +25,13 @@ def _write_midi(path):
         ]
     )
     violin.append(mido.Message("note_off", channel=0, note=64, velocity=0, time=240))  # held 1/2 beat
-    drums = mido.MidiTrack([mido.Message("note_on", channel=9, note=36, velocity=100, time=960)])  # never closed
+    drums = mido.MidiTrack(
+        [
+            mido.Message("note_on", channel=9, note=38, velocity=100, time=960),  # beat 2, 1/4 beat
+            mido.Message("note_off", channel=9, note=38, velocity=0, time=120),
+            mido.Message("note_on", channel=9, note=36, velocity=100, time=0),  # never closed
+        ]
+    )
     m.tracks.extend([tempo, violin, drums])
     m.save(str(path))
 
@@ -47,9 +53,24 @@ def test_raw_notes_keep_ticks_and_seconds(tmp_path):
     # beat 1 is reached at 0.5 s; the next half beat is at 60 bpm, so 0.5 s more
     assert abs(second.onset - 1.0) < 1e-9 and abs(second.dur - 0.5) < 1e-9
 
-    (drum,) = tracks[1]
-    assert drum.instrument == DRUM_INSTR and drum.onset_beats(tpb) == 2 and abs(drum.onset - 1.5) < 1e-9
-    assert drum.dur is None and drum.dur_ticks is None and drum.dur_beats(tpb) is None
+    (drum,) = tracks[1]  # the unclosed hit is dropped, as in ~/orchestration's reader
+    assert drum.instrument == 116 and drum.onset_beats(tpb) == 2 and abs(drum.onset - 1.5) < 1e-9
+    assert drum.dur_ticks == 120
+
+
+def test_tracks_sharing_a_channel_keep_their_own_programs(tmp_path):
+    """Regression: the per-channel reader gave both tracks the program set last on channel 0."""
+    m = mido.MidiFile(type=1, ticks_per_beat=480)
+    for program, pitch in ((40, 76), (42, 48)):  # violin, then cello, both on channel 0
+        m.tracks.append(mido.MidiTrack([
+            mido.Message("program_change", channel=0, program=program, time=0),
+            mido.Message("note_on", channel=0, note=pitch, velocity=80, time=480),
+            mido.Message("note_off", channel=0, note=pitch, velocity=0, time=480),
+        ]))  # fmt: skip
+    path = tmp_path / "shared.mid"
+    m.save(str(path))
+    _, tracks = midi_to_raw_notes(path)
+    assert [[n.instrument for n in t] for t in tracks] == [[40], [42]]
 
 
 def test_track_events_match_raw_notes(tmp_path):

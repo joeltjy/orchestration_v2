@@ -86,3 +86,21 @@ own decisions where the spec is open. Every such decision is logged here with a 
   chord) does not break the chain, and the spec's 4-note window still applies on top. Test corpus: step 4 keeps
   226,320 note quads instead of 183,442 (the old rule skipped over notes in between); after step 7, 97,939
   instead of 92,796. Full corpus rerun on hai-res-mobile01.
+
+[2026-11-05 10:12] Program reading now follows ~/orchestration's extract_orchestra_notes: program state per
+  (track, channel); the staff name overrides the program for winds/brass/timpani/voices when resolve_track_program
+  accepts it (title-like names ignored, piccolo staves -> GM 72). I also adopted its channel-9 timpani rule (timpani-
+  named tracks: pitches 36-57 -> GM 47, others dropped), which comes with the same function. String names are not
+  resolved, as in the original, so e.g. a "Viola" staff on GM 0 stays piano.
+[2026-11-05 10:12] Organ removal: moved 19 originally solo-organ pieces to the Trash (list in README). Kept as
+  borderline: Handel organ concertos op. 7 nos. 1-2, Saint-Saens Organ Symphony theme, Hartmann Gejstlig ouverture,
+  Poglietti Aria Allemagna (harpsichord), and orchestral/choral works with an organ continuo track.
+[2026-11-05 10:12] Step 5 patterns: at most 3 distinct pitches (PATTERN_MAX_DISTINCT_PITCHES). The monotone
+  exclusion stays, now only affecting (1,2,3) and (3,2,1).
+[2026-11-05 10:18] Superseding the program-reading entry above: midi_to_raw_notes now calls ~/orchestration's
+  create_note_representation (the first step of its reduction: extract_orchestra_notes per track, then
+  apply_program_overrides) instead of reimplementing it. The wrong method was the old merge-tracks, one-program-per-
+  channel reader inherited from AMT (fixed there in fd8b37f), which is what symphonynet.py used to do. Consequences:
+  unclosed and zero-length notes are now dropped (the 1/2-beat unclosed rule in read_piece no longer fires), drum-
+  channel notes are GM 116. Checked on all 707 files: identical (track, onset tick, duration tick, pitch, program)
+  multisets to create_note_representation, 7,263,242 notes.
