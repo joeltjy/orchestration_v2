@@ -104,3 +104,11 @@ own decisions where the spec is open. Every such decision is logged here with a 
   unclosed and zero-length notes are now dropped (the 1/2-beat unclosed rule in read_piece no longer fires), drum-
   channel notes are GM 116. Checked on all 707 files: identical (track, onset tick, duration tick, pitch, program)
   multisets to create_note_representation, 7,263,242 notes.
+[2026-11-05 11:07] Duplicate tracks (step 0): a track is dropped as a layered copy only if its name ends in a
+  copy suffix ("-1", "Pamina1"; not "Oboe 1-2" / "Violine 2") AND >=95% of its (onset tick, pitch) pairs occur in the
+  union of the piece's non-suffixed tracks. Name-only or overlap-only rules were rejected: fully overlapping pairs
+  include real colla-parte doublings (Messiah oboe = soprano, B-minor Mass bassoon/organ = cello, Requiem alto
+  trombone = alto), which carry no suffix. Survey: 141 tracks / ~46.5k notes dropped (138 in Zauberfloete, plus 3
+  tiny ones in Beethoven 61a, Galynin, Shostakovich). Not dropped (suffix, 80-95% overlap): 21 tracks, 17 of them
+  Zauberfloete layers that add ornaments or re-placed notes (e.g. 21a "1. Knabe-1", whose 56 unmatched notes sit 1/16
+  beat off), and Tchaikovsky op. 35 "flauti2" (a real part, 94%).

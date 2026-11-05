@@ -102,3 +102,15 @@ def test_repeated_notes_need_nothing_in_between():
     voice = _voice([(0, 0.4, 60), (0.5, 0.4, 60), (0.5, 0.4, 64), (1.0, 0.4, 60), (1.5, 0.4, 60)], table)
     out = remove_repeated_notes(voice, table)
     assert sorted(n.pitch for n in out) == [60, 64] and len(out) == 2
+
+
+def test_layered_copy_tracks_are_dropped_but_real_doublings_kept():
+    from types import SimpleNamespace
+
+    from orchestration_v2.reduction_v1 import duplicate_tracks
+
+    line = [SimpleNamespace(onset_ticks=480 * i, pitch=60 + i % 5) for i in range(40)]
+    other = [SimpleNamespace(onset_ticks=480 * i + 240, pitch=50) for i in range(40)]
+    names = ["Violini I", "Oboe", "Violins I-1", "Pamina1", "Bassoon 1-2"]
+    tracks = [line, list(line), list(line), other, list(line)]  # oboe colla parte, a layer, a real part, "1-2"
+    assert duplicate_tracks(names, tracks) == [2]

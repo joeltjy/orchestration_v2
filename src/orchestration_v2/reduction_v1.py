@@ -86,6 +86,7 @@ import csv
 import heapq
 import math
 import os
+import re
 import statistics
 import sys
 from collections import Counter, defaultdict
@@ -131,6 +132,8 @@ _TAX20_MEMBERS = {
 }  # fmt: skip
 GM_TO_TAX20 = {gm: idx for idx, gms in _TAX20_MEMBERS.items() for gm in gms}
 
+DUPLICATE_TRACK_MIN_SHARE = 0.95  # step 0: share of a copy-suffixed track's notes found in the other tracks
+COPY_SUFFIX = re.compile(r"((?<!\d)-\d+|(?<=[A-Za-z])\d)$")  # step 0: "Violins I-1", "Pamina1"
 PATTERN_MAX_DISTINCT_PITCHES = 3  # step 5: a repeated pattern may use at most this many distinct pitches
 
 # read-only: the voice splitter (step 2); override with the ORCHESTRATION_SRC environment variable
@@ -285,6 +288,7 @@ class Piece:
     ignored: list[tuple[float, float, int, int, int]] = field(
         default_factory=list
     )  # (onset s, dur s, pitch, track, GM)
+    duplicate_tracks: list[int] = field(default_factory=list)  # tracks dropped in step 0 as layered copies
     patterns: PatternTable = field(default_factory=PatternTable)  # this piece's share, merged into the corpus's
     log: list[str] = field(default_factory=list)
 
@@ -344,6 +348,16 @@ def tokenize_corpus(corpus_dir: Path, outliers_csv: Path, measurements_csv: Path
     #     string ensemble and flute;
     #   * leftover programs: any GM program other than 116 that the remap only sends to unpitched (116) as a
     #     fallback, e.g. vibraphone 11 or tubular bells 14.
+    #   * layered duplicate tracks: some transcriptions (mostly the Icking-archive Zauberfloete numbers) add a
+    #     second copy of a part with another sound, e.g. "Violins I-1" (GM 41) under "Violini I" (GM 48), so every
+    #     line sounds twice. A track is dropped as such a copy when both hold:
+    #       - its name ends in a copy suffix: "-<digits>" not preceded by a digit ("Violins I-1", "Dame2-1", but
+    #         not "Oboe 1-2"), or a digit right after a letter ("Pamina1", but not "Violine 2" or "Tromba 1");
+    #       - at least DUPLICATE_TRACK_MIN_SHARE (95%) of its notes, compared as (onset tick, pitch), also occur
+    #         in the piece's other tracks that have no copy suffix (a copy often doubles several original tracks
+    #         at once, so the comparison is against their union).
+    #     Real unison doublings in the score (an oboe colla parte with the sopranos, bassoon with cello) are kept:
+    #     their names carry no copy suffix. Dropped notes are listed with the ignored ones ("not read in").
     #
     # Step 1 - sort. Within each track, sort notes by onset, breaking ties by pitch. "Consecutive-onset
     #   notes" from here on means notes that are adjacent in this sorted list (or, once voices exist,
@@ -686,6 +700,16 @@ def _track_names(midi: mido.MidiFile) -> list[str]:
     return names
 
 
+def duplicate_tracks(names: list[str], tracks: list[list]) -> list[int]:
+    """Step 0: tracks that are layered copies of other tracks (see the step 0 notes in tokenize_corpus)."""
+    copies = [t for t, name in enumerate(names) if COPY_SUFFIX.search(name.strip()) and tracks[t]]
+    if not copies:
+        return []
+    base = {(r.onset_ticks, r.pitch) for t, raws in enumerate(tracks) if t not in copies for r in raws}
+    share = DUPLICATE_TRACK_MIN_SHARE
+    return [t for t in copies if sum((r.onset_ticks, r.pitch) in base for r in tracks[t]) >= share * len(tracks[t])]
+
+
 def read_piece(path: Path) -> Piece:
     """Step 0 (and step 1): read a MIDI into Note objects, mapped onto tax-20, sorted per track."""
     tpb, tracks = midi_to_raw_notes(path)
@@ -693,10 +717,15 @@ def read_piece(path: Path) -> Piece:
     piece = Piece(path.name, path, tpb, len(tracks), _track_names(midi), ReductionTable(), _tempo_map(midi))
     if len(piece.track_names) != len(tracks):  # should not happen; keep names aligned anyway
         piece.track_names = [f"track {k}" for k in range(len(tracks))]
+    piece.duplicate_tracks = duplicate_tracks(piece.track_names, tracks)
+    if piece.duplicate_tracks:
+        dropped_names = ", ".join(piece.track_names[t] for t in piece.duplicate_tracks)
+        piece.log.append(f"step 0: dropped layered copies {dropped_names}")
     for t, raws in enumerate(tracks):
         track_key = (t,)  # one shared tuple per track (memory)
+        dropped = t in piece.duplicate_tracks
         for r in raws:
-            inst = tax20_index(r.instrument)
+            inst = None if dropped else tax20_index(r.instrument)
             if inst is None:
                 piece.ignored.append((r.onset, r.dur if r.dur is not None else 0.0, r.pitch, t, r.instrument))
                 continue
