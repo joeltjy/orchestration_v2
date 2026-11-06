@@ -119,6 +119,11 @@ def build_training_arguments(stage: int, output_dir: str | Path | None = None, *
         run_name=f"{cfg['run_name']}_dryrun" if dryrun else cfg["run_name"],
     )
     kwargs.update(overrides)
+    # transformers < 4.41 calls it evaluation_strategy (the cluster env has 4.40)
+    import inspect
+
+    if "eval_strategy" not in inspect.signature(TrainingArguments.__init__).parameters:
+        kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
     return TrainingArguments(**kwargs)
 
 

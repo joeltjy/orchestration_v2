@@ -169,3 +169,30 @@ def test_pairs_frame_columns():
                      ref_index=np.arange(3), info={})
     df = pair_notes_frame("p", a)
     assert isinstance(df, pd.DataFrame) and len(df) == 3 and {"note_idx", "perf_onset_s"} <= set(df.columns)
+
+
+def test_trainer_runs_two_steps_with_eval_and_save(tmp_path, monkeypatch):
+    """Training path with the installed transformers: args, optimizer groups, eval, best-model reload, save."""
+    pytest.importorskip("torch")
+    monkeypatch.setenv("WANDB_DISABLED", "true")
+    from orchestration_v2.configs.expressifier_train import build_training_arguments
+    from orchestration_v2.dataloaders.expressifier_dataloader import ExpressifierDataset, collate_expressifier_batch
+    from orchestration_v2.models.expressifier import is_expressifier_checkpoint
+    from orchestration_v2.train.expressifier_train import make_save_callback, make_trainer_class
+
+    p = _piece(300)
+    chunks = [(i, o, m, "piece0", k) for i, o, m, k in tokenize_piece("piece0", p, ["none"], 0)]
+    for split in ("train", "test"):
+        write_shard(tmp_path / "data" / split / "s0", chunks)
+    write_manifest(tmp_path / "data")
+    ds = ExpressifierDataset(tmp_path / "data", "train")
+    args = build_training_arguments(2, tmp_path / "out", with_eval=True, report_to="none", max_steps=2,
+                                    eval_steps=1, save_steps=1, logging_steps=1, per_device_train_batch_size=2,
+                                    per_device_eval_batch_size=2, dataloader_num_workers=0, use_cpu=True)
+    trainer = make_trainer_class()(model=_tiny_model().train(), args=args, train_dataset=ds, eval_dataset=ds,
+                                   data_collator=collate_expressifier_batch, callbacks=[make_save_callback()])
+    trainer.train()
+    lrs = sorted({g.get("initial_lr", g["lr"]) for g in trainer.optimizer.param_groups})  # before the schedule
+    assert len(lrs) == 2 and abs(lrs[1] / lrs[0] - 10.0) < 1e-6  # decoder at 10x the encoder lr
+    assert is_expressifier_checkpoint(tmp_path / "out" / "best")
+    assert is_expressifier_checkpoint(tmp_path / "out" / "checkpoint-2")
