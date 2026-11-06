@@ -77,7 +77,7 @@ def test_augmentation_schedule_and_transforms():
     assert len(set(shift)) == 1 and abs(int(shift[0])) <= 12
     t = augment(p, "tempo", piece_rng("x", 2, 0))
     f = t["perf_on"][5] / p["perf_on"][5]
-    assert 0.5 <= f <= 2.0 and np.allclose(t["score_on"], p["score_on"] * f)
+    assert 0.8 <= f <= 1.2 and np.allclose(t["score_on"], p["score_on"] * f)
     v = augment(p, "velocity", piece_rng("x", 3, 0))
     assert np.array_equal(v["score_on"], p["score_on"]) and v["velocity"].min() >= 1
 

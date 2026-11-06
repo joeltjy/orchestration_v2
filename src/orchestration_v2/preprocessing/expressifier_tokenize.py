@@ -5,7 +5,7 @@ Input pairs (one row per score note, in score order = sorted by score onset, the
     Performances whose ASAP recording is a MAESTRO validation/test file are dropped from stage-1 train so
     stage-2 evaluation stays unseen.
   * stage 2: ``aligned_pianocore_maestro`` (MAESTRO crops), materialised augmentation (default 16x, schedule
-    and ranges as ``preprocessing.amt_dense``: none + pitch +-12 + tempo x0.5-2 + velocity x0.5-1.5),
+    as ``preprocessing.amt_dense``: none + pitch +-12 + tempo x0.8-1.2 (TEMPO_RANGE) + velocity x0.5-1.5),
     MAESTRO's split (train; validation+test -> test).
 
 Chunking: walk each piece in score order cutting consecutive chunks whose length is drawn from
@@ -51,6 +51,7 @@ from orchestration_v2.constants import (
 
 SCRATCH_ROOT = Path("/data/scratch-oc40/joel")
 CS = 100  # dense-AMT time unit: centiseconds
+TEMPO_RANGE = (0.8, 1.2)  # tempo augmentation factor (amt_dense uses 0.5-2.0)
 
 
 # ------------------------------------------------------------------ chunking / tokens
@@ -112,7 +113,7 @@ def augment(piece: dict[str, np.ndarray], kind: str, rng: np.random.Generator) -
         lo, hi = max(-12, -int(p["pitch"].min())), min(12, 127 - int(p["pitch"].max()))
         p["pitch"] = p["pitch"] + int(rng.integers(lo, hi + 1))
     elif kind == "tempo":
-        f = float(rng.uniform(0.5, 2.0))
+        f = float(rng.uniform(*TEMPO_RANGE))
         for k in ("score_on", "score_off", "perf_on", "perf_off"):
             p[k] = p[k] * f
     elif kind == "velocity":
