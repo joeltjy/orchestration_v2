@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J expressifier
 #SBATCH -A hai-res
-#SBATCH -p hai-res
+#SBATCH -p hai-res-l40s
 #SBATCH --gres=gpu:2
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -17,7 +17,9 @@
 #   STAGE=1 sbatch --job-name=expressifier_s1 .../scripts/train_expressifier.slurm
 #   STAGE=2 sbatch --job-name=expressifier_s2 .../scripts/train_expressifier.slurm   # from stage-1 best
 #   STAGE=1 DRYRUN=1 sbatch .../scripts/train_expressifier.slurm
-#   STAGE=1 RESUME_FROM=.../expressifier_stage1/checkpoint-XXXX sbatch ...
+#   STAGE=1 RESUME_FROM=latest sbatch ...   # or RESUME_FROM=.../expressifier_stage1/checkpoint-XXXX
+# Pass variables as env (STAGE=1 sbatch ...), not via sbatch --export=ALL,STAGE=1: on this cluster the
+# latter gets jobs cancelled by Slurm at start (2026-11-06).
 # Options: DATA_ROOT, OUTPUT_DIR, INIT_FROM (stage 2; 'none' = fresh), ENCODER_CHECKPOINT, DECODER_LAYERS.
 
 set -x
@@ -32,6 +34,14 @@ extra_args=(--stage "${STAGE:?set STAGE=1 or 2}")
 [ -n "${INIT_FROM:-}" ] && extra_args+=(--init-from "${INIT_FROM}")
 [ -n "${ENCODER_CHECKPOINT:-}" ] && extra_args+=(--encoder-checkpoint "${ENCODER_CHECKPOINT}")
 [ -n "${DECODER_LAYERS:-}" ] && extra_args+=(--decoder-layers "${DECODER_LAYERS}")
+if [ "${RESUME_FROM:-}" = "latest" ]; then
+    # newest complete checkpoint-N (has trainer_state.json) in the stage's output dir, resolved at start time
+    ckpt_dir="${OUTPUT_DIR:-${SCRATCH_ROOT}/checkpoints/expressifier_stage${STAGE}}"
+    RESUME_FROM="$(ls -d "${ckpt_dir}"/checkpoint-* 2>/dev/null | sort -t- -k2 -n -r \
+        | while read -r c; do [ -f "$c/trainer_state.json" ] && { echo "$c"; break; }; done)"
+    [ -n "${RESUME_FROM}" ] || { echo >&2 "FATAL: RESUME_FROM=latest but no checkpoint in ${ckpt_dir}"; exit 1; }
+    echo "resuming from ${RESUME_FROM}"
+fi
 [ -n "${RESUME_FROM:-}" ] && extra_args+=(--resume-from-checkpoint "${RESUME_FROM}")
 [ "${DRYRUN:-0}" = "1" ] && extra_args+=(--dryrun)
 
