@@ -106,6 +106,24 @@ def test_shard_roundtrip_dataset_and_collate(tmp_path):
     assert batch["input_ids"].shape == batch["labels"].shape == batch["attention_mask"].shape
 
 
+def test_dataset_keeps_few_shards_open(tmp_path):
+    pytest.importorskip("torch")
+    from orchestration_v2.dataloaders.expressifier_dataloader import ExpressifierDataset
+
+    for s in range(6):
+        p = _piece(100, seed=s)
+        chunks = [(i, o, m, f"piece{s}", k) for i, o, m, k in tokenize_piece(f"piece{s}", p, ["none"], 0)]
+        write_shard(tmp_path / "train" / f"s{s}", chunks)
+    write_manifest(tmp_path)
+    full = ExpressifierDataset(tmp_path, "train")
+    lru = ExpressifierDataset(tmp_path, "train", max_open_shards=2)
+    assert len(full._open) == 0  # nothing opened at construction
+    for g in list(range(len(lru))) + list(range(len(lru)))[::-1]:
+        a, b = full[g], lru[g]
+        assert all(bool((a[k] == b[k]).all()) for k in a)
+        assert len(lru._open) <= 2
+
+
 def _tiny_model():
     torch = pytest.importorskip("torch")
     from transformers import GPT2Config, GPT2Model
