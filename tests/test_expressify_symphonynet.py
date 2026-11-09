@@ -149,4 +149,4 @@ def test_shard_files_partition(tmp_path):
         files.append(f)
     shards = [shard_files(files, 3, k) for k in range(3)]
     assert sorted(sum(shards, [])) == sorted(files) and len({f for s in shards for f in s}) == 10
-    assert shards[0][0].name == "p9"  # largest first
+    assert shards[0][0].name == "p9.mid"  # largest first
