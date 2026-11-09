@@ -137,3 +137,16 @@ def test_long_segment_and_mapping_rows(tmp_path):
     path = tmp_path / "p.parquet"
     mapping.to_parquet(path, index=False)
     assert len(load_mapping(path)) <= len(raw)
+
+
+def test_shard_files_partition(tmp_path):
+    from orchestration_v2.sampling.expressify_symphonynet import shard_files
+
+    files = []
+    for i in range(10):
+        f = tmp_path / f"p{i}.mid"
+        f.write_bytes(b"x" * (i + 1) * 10)
+        files.append(f)
+    shards = [shard_files(files, 3, k) for k in range(3)]
+    assert sorted(sum(shards, [])) == sorted(files) and len({f for s in shards for f in s}) == 10
+    assert shards[0][0].name == "p9"  # largest first

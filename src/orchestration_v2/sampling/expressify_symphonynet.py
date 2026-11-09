@@ -356,6 +356,14 @@ def load_mapping(path: str | Path, sample: int = 0) -> dict[tuple[int, tuple], t
             (r.expr_onset, r.expr_dur, int(r.expr_pitch), int(r.expr_velocity)) for r in df.itertuples()}
 
 
+def shard_files(files: list[Path], num_shards: int, index: int) -> list[Path]:
+    """Largest files first, dealt round-robin, so shards get similar amounts of music."""
+    if not 0 <= index < num_shards:
+        raise ValueError(f"shard index {index} not in [0, {num_shards})")
+    ordered = sorted(files, key=lambda f: (-f.stat().st_size, f.name))
+    return ordered[index::num_shards]
+
+
 # ------------------------------------------------------------------ CLI
 def main(argv=None) -> None:
     import torch
@@ -374,6 +382,8 @@ def main(argv=None) -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--gap", type=float, default=SEGMENT_GAP_S)
     ap.add_argument("--window", type=int, default=EXPRESSIFIER_MAX_NOTES)
+    ap.add_argument("--num-shards", type=int, default=1, help="split pieces across this many processes/GPUs")
+    ap.add_argument("--shard-index", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", 0)))
     args = ap.parse_args(argv)
 
     def log(msg: str) -> None:
@@ -385,7 +395,11 @@ def main(argv=None) -> None:
     if args.limit:
         files = files[:args.limit]
     settings = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
-    (out / "manifest.json").write_text(json.dumps(dict(settings=settings, files=[f.name for f in files]), indent=1))
+    manifest = out / ("manifest.json" if args.num_shards == 1 else f"manifest.shard{args.shard_index}.json")
+    if args.num_shards > 1:
+        files = shard_files(files, args.num_shards, args.shard_index)
+        log(f"shard {args.shard_index}/{args.num_shards}")
+    manifest.write_text(json.dumps(dict(settings=settings, files=[f.name for f in files]), indent=1))
     todo = [f for f in files if not (out / f"{f.stem}.parquet").exists()]
     log(f"{len(files)} piano concertos, {len(files) - len(todo)} already done, {len(todo)} to do")
 
