@@ -139,15 +139,32 @@ class ExpressifierModel(nn.Module):
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None, *,
                  temperature: float = 1.0, top_p: float | None = 0.95, copy_pitch: bool = True,
-                 generator: torch.Generator | None = None) -> torch.Tensor:
+                 generator: torch.Generator | None = None, prefix_ids: torch.Tensor | None = None,
+                 prefix_len: torch.Tensor | None = None, uniforms: torch.Tensor | None = None) -> torch.Tensor:
         """Sample performance tokens for each score chunk (4N each). ``copy_pitch`` forces the note token to
-        the score's note (the performance of note i is the performance of score note i)."""
+        the score's note (the performance of note i is the performance of score note i).
+
+        ``prefix_ids`` [B, L] with ``prefix_len`` [B] (in tokens, a multiple of 4): positions t < prefix_len[b]
+        are forced to prefix_ids[b, t] instead of sampled (sliding-window continuation; the decoder is causal,
+        so this equals having generated them).
+
+        ``uniforms`` [B, L] in [0, 1): if given, position t of row b is sampled by inverse CDF with
+        uniforms[b, t] instead of ``torch.multinomial`` -- lets callers give every row its own RNG stream, so a
+        row's samples do not depend on what else is in the batch."""
         self.eval()
         B, L = input_ids.shape
         pad = None if attention_mask is None else ~attention_mask.bool()
         memory = self.encode(input_ids, attention_mask)
         out = torch.zeros(B, L, dtype=torch.long, device=input_ids.device)
-        for t in range(L):  # no KV cache: chunks are <= 512 tokens
+        t0 = 0
+        if prefix_ids is not None:
+            if prefix_len is None:
+                raise ValueError("prefix_ids needs prefix_len")
+            prefix_len = prefix_len.to(input_ids.device).long()
+            forced = torch.arange(L, device=input_ids.device)[None] < prefix_len[:, None]  # [B, L]
+            out = torch.where(forced, prefix_ids.to(input_ids.device).long(), out)
+            t0 = int(prefix_len.min())  # positions every row forces need no decoder pass
+        for t in range(t0, L):  # no KV cache: chunks are <= 512 tokens
             logits = self.decode_logits(memory, pad, self.decoder_inputs(out)[:, :t + 1],
                                         None if pad is None else pad[:, :t + 1])[:, t].float()
             if copy_pitch and t % T == 2:
@@ -161,7 +178,14 @@ class ExpressifierModel(nn.Module):
                     keep = sp.cumsum(-1) - sp <= top_p
                     probs = torch.zeros_like(probs).scatter(-1, si, sp * keep)
                     probs = probs / probs.sum(-1, keepdim=True)
-                nxt = torch.multinomial(probs, 1, generator=generator).squeeze(-1)
+                if uniforms is not None:
+                    cdf = probs.double().cumsum(-1)
+                    u = uniforms[:, t:t + 1].to(cdf) * cdf[:, -1:]
+                    nxt = torch.searchsorted(cdf, u, right=True).squeeze(-1).clamp(max=probs.shape[-1] - 1)
+                else:
+                    nxt = torch.multinomial(probs, 1, generator=generator).squeeze(-1)
+            if prefix_ids is not None:
+                nxt = torch.where(forced[:, t], out[:, t], nxt)
             out[:, t] = nxt
         if attention_mask is not None:
             out = out.masked_fill(~attention_mask.bool(), 0)
